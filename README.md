@@ -24,7 +24,7 @@ python3 -m pip install tinytag
 
 ## Features
 
-  * Read tags, images and properties of audio files
+  * Read tags, images, chapters and properties of audio files
   * Supported formats:
     * ID3 v1, v1.1, v2.2, v2.3, v2.4
     * MP3 / MP2 / MP1
@@ -321,6 +321,44 @@ tag: TinyTag = TinyTag.get('/some/music.mp3')
 metadata: dict = tag.as_dict()
 ```
 
+### Chapters
+
+Podcasts and audiobooks often split their audio into chapters. tinytag
+reads chapter information from ID3v2 `CHAP`/`CTOC` frames (MP3), the MP4
+`chpl` and QuickTime chapter track atoms, and Vorbis `CHAPTERxxx` comments
+(OGG/FLAC):
+
+```python
+tag.chapters: Chapters        # a list of Chapter objects
+```
+
+Each `Chapter` provides:
+
+```python
+chapter.title: str | None     # chapter title, if the file provides one
+chapter.start: float          # start time in seconds
+chapter.end: float | None     # end time in seconds, if known
+chapter.index: int            # zero-based position in the file
+chapter.duration: float | None  # end - start, if known
+```
+
+Chapters are returned in playback order: nested ID3 `CTOC` tables of
+contents are flattened, and chapters not referenced by any table of contents
+are appended in storage order. `index` matches the position in the returned
+list. A chapter list is empty when the file contains no chapter metadata.
+
+Malformed chapter metadata does not make reading a file fail. Truncated
+frames, duplicate chapter identifiers, circular tables of contents, missing
+titles or inconsistent timestamps are reported through
+`chapter_warnings`, and the remaining chapters are still returned:
+
+```python
+for warning in tag.chapter_warnings:
+    print(warning)
+```
+
+Use `tag.chapters.as_list()` to get a list of dictionaries instead.
+
 ### Images
 
 Additionally, you can also read embedded images by passing a `image=True`
@@ -487,6 +525,12 @@ UnsupportedFormatError  # File format is not supported
 
 
 ## Changelog
+
+### Unreleased
+
+- Add chapter reading for ID3v2 CHAP/CTOC, MP4 chpl/QuickTime chapter
+  tracks and Vorbis CHAPTERxxx comments
+- Add 'chapters' and 'chapter_warnings' attributes
 
 ### 2.3.2  (2026-09-07)
 

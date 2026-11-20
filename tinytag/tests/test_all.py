@@ -16,14 +16,18 @@ from sys import stdout
 from unittest import skipIf, TestCase
 
 from tinytag import ParseError, TinyTagException, UnsupportedFormatError
-from tinytag import Image, Images, OtherFields, OtherImages, TinyTag
-from tinytag.tinytag import _ID3, _MPEG, _Ogg, _Wave, _Flac, _ASF, _MP4, _Aiff
+from tinytag import (Chapter, Chapters, Image, Images, OtherFields,
+                     OtherImages, TinyTag)
+from tinytag.tinytag import (
+    _ID3, _MPEG, _Ogg, _Wave, _Flac, _ASF, _MP4, _Aiff,
+    _ChapterFrame, _ChapterTOC
+)
 
 TYPE_CHECKING = False
 
 # Lazy imports for type checking
 if TYPE_CHECKING:
-    from typing import BinaryIO, Mapping, Union
+    from typing import Any, BinaryIO, Mapping, Union
     ExpectedTag = Mapping[str, Union[str, float, OtherFields]]
     ExpectedImages = Mapping[str, Union[Image, OtherImages]]
 else:
@@ -3032,6 +3036,88 @@ TEST_FILES: dict[str, ExpectedTag] = dict([
         'mime_type': 'audio/aiff',
         'filesize': 12,
     }),
+    ('chapters_id3v24.mp3', {
+        'other': OtherFields(),
+        'mime_type': 'audio/mpeg',
+        'is_lossless': False,
+        'filesize': 8743,
+        'duration': 4.176,
+        'channels': 1,
+        'bitrate': 16.0,
+        'samplerate': 8000,
+        'artist': 'Test Author',
+        'title': 'Test Episode',
+    }),
+    ('chapters_id3v23.mp3', {
+        'other': OtherFields(),
+        'mime_type': 'audio/mpeg',
+        'is_lossless': False,
+        'filesize': 8547,
+        'duration': 4.176,
+        'channels': 1,
+        'bitrate': 16.0,
+        'samplerate': 8000,
+        'title': 'Legacy Episode',
+    }),
+    ('chapters_id3_no_ctoc.mp3', {
+        'other': OtherFields(),
+        'mime_type': 'audio/mpeg',
+        'is_lossless': False,
+        'filesize': 8478,
+        'duration': 4.176,
+        'channels': 1,
+        'bitrate': 16.0,
+        'samplerate': 8000,
+        'title': 'Linear Episode',
+    }),
+    ('chapters_vorbis.ogg', {
+        'other': OtherFields(),
+        'mime_type': 'audio/ogg; codecs="vorbis"',
+        'is_lossless': False,
+        'filesize': 5447,
+        'duration': 4.0,
+        'channels': 1,
+        'bitrate': 22.4,
+        'samplerate': 8000,
+        'artist': 'Test Author',
+        'title': 'Test Episode',
+    }),
+    ('chapters_mp4.m4a', {
+        'other': OtherFields({
+            'encoded_by': ['Lavf62.3.100'],
+        }),
+        'mime_type': 'audio/mp4; codecs="mp4a.40.2"',
+        'is_lossless': False,
+        'filesize': 10006,
+        'duration': 4.0,
+        'channels': 1,
+        'bitrate': 16.25,
+        'samplerate': 8000,
+    }),
+    ('chapters_mp4_track.m4a', {
+        'other': OtherFields({
+            'encoded_by': ['Lavf62.3.100'],
+        }),
+        'mime_type': 'audio/mp4; codecs="mp4a.40.2"',
+        'is_lossless': False,
+        'filesize': 9943,
+        'duration': 4.0,
+        'channels': 1,
+        'bitrate': 16.25,
+        'samplerate': 8000,
+    }),
+    ('chapters_mp4_chpl_only.m4a', {
+        'other': OtherFields({
+            'encoded_by': ['Lavf62.3.100'],
+        }),
+        'mime_type': 'audio/mp4; codecs="mp4a.40.2"',
+        'is_lossless': False,
+        'filesize': 9467,
+        'duration': 4.0,
+        'channels': 1,
+        'bitrate': 16.25,
+        'samplerate': 8000,
+    }),
 ])
 
 IMAGE_TEST_FILES: dict[str, ExpectedImages] = dict([
@@ -3650,3 +3736,783 @@ class TestAll(TestCase):
             "\\x00\\x01\\x01\\x00\\x00\\x02\\xa0lcm..', "
             "mime_type='image/jpeg', description='some image ë')]}"
         )
+
+
+CHAPTER_FILES: dict[str, list[tuple[str | None, float, float]]] = {
+    'chapters_id3v24.mp3': [
+        ('Chapter One', 0.0, 1.2),
+        ('Chapter Two', 1.2, 3.0),
+        ('Chapter Three', 3.0, 4.0),
+    ],
+    'chapters_id3v23.mp3': [
+        ('First Part', 0.0, 2.0),
+        ('Second Part', 2.0, 4.0),
+    ],
+    'chapters_id3_no_ctoc.mp3': [
+        ('Linear A', 0.5, 1.5),
+        (None, 1.5, 3.0),
+    ],
+    'chapters_vorbis.ogg': [
+        ('Opening', 0.0, 1.5),
+        ('Middle', 1.5, 3.0),
+        ('Closing', 3.0, 4.0),
+    ],
+    'chapters_mp4.m4a': [
+        ('Intro', 0.0, 1.0),
+        ('Main Part', 1.0, 2.5),
+        ('Outro', 2.5, 4.0),
+    ],
+    'chapters_mp4_track.m4a': [
+        ('Intro', 0.0, 1.0),
+        ('Main Part', 1.0, 2.5),
+        ('Outro', 2.5, 4.0),
+    ],
+    'chapters_mp4_chpl_only.m4a': [
+        ('Intro', 0.0, 1.0),
+        ('Main Part', 1.0, 2.5),
+        ('Outro', 2.5, 4.0),
+    ],
+}
+
+
+class TestChapters(TestCase):
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if isinstance(stdout, TextIOWrapper):
+            stdout.reconfigure(encoding='utf-8')
+        cls.maxDiff = None
+
+    def get_tag(self, filename: str) -> TinyTag:
+        return TinyTag.get(os.path.join(SAMPLE_FOLDER, filename))
+
+    def compare_chapters(self,
+                         chapters: Chapters,
+                         expected: list[tuple[str | None, float, float]],
+                         ) -> None:
+        self.assertEqual(len(chapters), len(expected))
+        for index, (chapter, values) in enumerate(zip(chapters, expected)):
+            title, start, end = values
+            self.assertIsInstance(chapter, Chapter)
+            self.assertEqual(chapter.index, index)
+            self.assertEqual(chapter.title, title)
+            self.assertAlmostEqual(chapter.start, start)
+            assert chapter.end is not None
+            self.assertAlmostEqual(chapter.end, end)
+            assert chapter.duration is not None
+            self.assertAlmostEqual(chapter.duration, end - start)
+
+    def test_chapters_id3v24(self) -> None:
+        tag = self.get_tag('chapters_id3v24.mp3')
+        self.compare_chapters(
+            tag.chapters, CHAPTER_FILES['chapters_id3v24.mp3'])
+        self.assertEqual(tag.chapter_warnings, [])
+        self.assertIsInstance(tag.chapters, Chapters)
+        self.assertEqual(len(tag.chapters.as_list()), 3)
+        self.assertEqual(
+            tag.chapters.as_list()[0],
+            {'title': 'Chapter One', 'start': 0.0, 'end': 1.2, 'index': 0}
+        )
+
+    def test_chapters_id3v23(self) -> None:
+        tag = self.get_tag('chapters_id3v23.mp3')
+        self.compare_chapters(
+            tag.chapters, CHAPTER_FILES['chapters_id3v23.mp3'])
+        self.assertEqual(tag.chapter_warnings, [])
+
+    def test_chapters_id3_no_ctoc(self) -> None:
+        tag = self.get_tag('chapters_id3_no_ctoc.mp3')
+        self.compare_chapters(
+            tag.chapters, CHAPTER_FILES['chapters_id3_no_ctoc.mp3'])
+        self.assertEqual(tag.chapter_warnings, [])
+
+    def test_chapters_vorbis(self) -> None:
+        tag = self.get_tag('chapters_vorbis.ogg')
+        self.compare_chapters(
+            tag.chapters, CHAPTER_FILES['chapters_vorbis.ogg'])
+        self.assertEqual(tag.chapter_warnings, [])
+
+    def test_chapters_mp4(self) -> None:
+        tag = self.get_tag('chapters_mp4.m4a')
+        self.compare_chapters(
+            tag.chapters, CHAPTER_FILES['chapters_mp4.m4a'])
+        self.assertEqual(tag.chapter_warnings, [])
+
+    def test_chapters_mp4_track(self) -> None:
+        tag = self.get_tag('chapters_mp4_track.m4a')
+        self.compare_chapters(
+            tag.chapters, CHAPTER_FILES['chapters_mp4_track.m4a'])
+        self.assertEqual(tag.chapter_warnings, [])
+
+    def test_chapters_mp4_chpl_only(self) -> None:
+        tag = self.get_tag('chapters_mp4_chpl_only.m4a')
+        self.compare_chapters(
+            tag.chapters, CHAPTER_FILES['chapters_mp4_chpl_only.m4a'])
+        self.assertEqual(tag.chapter_warnings, [])
+
+    def test_chapters_mp4_truncated(self) -> None:
+        tag = self.get_tag('chapters_mp4_truncated.m4a')
+        self.assertIsInstance(tag, _MP4)
+        # The truncated Nero chapter atom is rejected, and the QuickTime
+        # chapter track is used instead.
+        self.assertEqual(len(tag.chapters), 3)
+        self.assertIn('truncated chpl atom', tag.chapter_warnings)
+
+    def test_chapters_id3_broken(self) -> None:
+        tag = self.get_tag('chapters_id3_broken.mp3')
+        # Duplicate CHAP IDs and truncated frames do not abort parsing.
+        self.assertEqual(len(tag.chapters), 2)
+        self.assertIn("duplicate chapter ID 'x'", tag.chapter_warnings)
+        self.assertIn("truncated CHAP frame 'z'", tag.chapter_warnings)
+        self.assertIn('circular CTOC reference', ' '.join(
+            tag.chapter_warnings))
+        self.assertIn('ends before it starts', ' '.join(
+            tag.chapter_warnings))
+        self.assertIn('out of order', ' '.join(tag.chapter_warnings))
+        # The inverted end time is ignored; the end falls back to the audio
+        # duration since the next chapter starts earlier.
+        assert tag.duration is not None
+        assert tag.chapters[0].end is not None
+        self.assertAlmostEqual(tag.chapters[0].end, tag.duration)
+
+    def test_chapters_vorbis_broken(self) -> None:
+        tag = self.get_tag('chapters_vorbis_broken.ogg')
+        self.assertEqual(len(tag.chapters), 3)
+        self.assertIn('invalid chapter timestamp', ' '.join(
+            tag.chapter_warnings))
+        self.assertIn('out of order', ' '.join(tag.chapter_warnings))
+
+    def test_no_chapters(self) -> None:
+        for filename in ('cbr.mp3', 'test.ogg', 'test.m4a', 'test.wav'):
+            with self.subTest(filename=filename):
+                tag = self.get_tag(filename)
+                self.assertEqual(tag.chapters, [])
+                self.assertEqual(tag.chapter_warnings, [])
+                self.assertNotIn('chapters', tag.as_dict())
+
+    def test_chapters_without_tags(self) -> None:
+        for filename in CHAPTER_FILES:
+            with self.subTest(filename=filename):
+                tag = TinyTag.get(
+                    os.path.join(SAMPLE_FOLDER, filename),
+                    tags=False, duration=True)
+                self.assertEqual(tag.chapters, [])
+
+    def test_chapters_without_duration(self) -> None:
+        for filename, expected in CHAPTER_FILES.items():
+            with self.subTest(filename=filename):
+                tag = TinyTag.get(
+                    os.path.join(SAMPLE_FOLDER, filename),
+                    tags=True, duration=False)
+                self.assertEqual(len(tag.chapters), len(expected))
+                # Without a duration, formats that do not store an explicit
+                # chapter end cannot derive one for the last chapter.
+                if filename.endswith(('.ogg', '.m4a')):
+                    if filename == 'chapters_vorbis.ogg':
+                        self.assertIsNone(tag.chapters[-1].end)
+
+    def test_chapter_equality_and_repr(self) -> None:
+        chapter = Chapter('Title', 1.0, 2.0, 3)
+        self.assertEqual(chapter, Chapter('Title', 1.0, 2.0, 3))
+        self.assertNotEqual(chapter, Chapter('Other', 1.0, 2.0, 3))
+        self.assertEqual(chapter.duration, 1.0)
+        self.assertEqual(hash(chapter), hash(Chapter('Title', 1.0, 2.0, 3)))
+        self.assertIn("title='Title'", repr(chapter))
+        self.assertEqual(
+            chapter.as_dict(),
+            {'title': 'Title', 'start': 1.0, 'end': 2.0, 'index': 3}
+        )
+
+    def test_chapter_file_object(self) -> None:
+        path = os.path.join(SAMPLE_FOLDER, 'chapters_id3v24.mp3')
+        with open(path, 'rb') as file_handle:
+            tag = TinyTag.get(file_obj=file_handle)
+        self.assertEqual(len(tag.chapters), 3)
+        self.assertEqual(tag.chapters[0].title, 'Chapter One')
+
+    def test_chapter_parsing_helpers(self) -> None:
+        # Chapter subframe helpers are reused by the ID3 parser.
+        self.assertEqual(
+            _ID3._read_chapter_string(b'abc\x00rest'), ('abc', 4))
+        self.assertEqual(
+            _ID3._read_chapter_string(b'abc'), (None, 0))
+        parser = _ID3()
+        # ID3v2.4 text subframes use synchsafe sizes
+        subframes = list(parser._parse_subframes(
+            b'TIT2\x00\x00\x00\x06\x00\x00\x03Hello', 4))
+        self.assertEqual(subframes, [(b'TIT2', b'\x03Hello')])
+        self.assertIsNone(parser._decode_text_subframe(b''))
+        self.assertIsNone(parser._decode_text_subframe(b'\x09bad'))
+        self.assertEqual(
+            parser._decode_text_subframe(b'\x03Text'), 'Text')
+
+    def test_chapters_beyond_audio(self) -> None:
+        # A chapter starting past the end of the audio is kept, but
+        # flagged so callers know the timestamp is inconsistent.
+        parser = _ID3()
+        parser.duration = 1.0
+        parser._chap_frames = [
+            _ChapterFrame('a', 0, 500, 'Start'),
+            _ChapterFrame('b', 5000, 9000, 'Far away'),
+        ]
+        parser._resolve_id3_chapters()
+        parser._finalize_chapters()
+        self.assertEqual(len(parser.chapters), 2)
+        self.assertIn('chapter 1 starts beyond the audio',
+                      parser.chapter_warnings)
+        self.assertIn('chapter 1 ends beyond the audio',
+                      parser.chapter_warnings)
+
+    def test_chapters_unknown_end(self) -> None:
+        parser = _ID3()
+        parser.duration = None
+        parser._chap_frames = [
+            _ChapterFrame('a', 1000, None, 'No end'),
+        ]
+        parser._resolve_id3_chapters()
+        parser._finalize_chapters()
+        self.assertEqual(len(parser.chapters), 1)
+        self.assertIsNone(parser.chapters[0].end)
+        self.assertIsNone(parser.chapters[0].duration)
+
+    def test_chapter_v21_v22_frames(self) -> None:
+        # ID3v2.2 CHAP/CTOC frames are not defined by the spec; tinytag
+        # ignores them rather than failing.
+        parser = _ID3()
+        parser._parse_chapter_frame(
+            b'CHAP', b'\x00' * 4, id3version=2)
+        self.assertEqual(parser.chapters, [])
+
+    def test_chapter_duplicate_toc(self) -> None:
+        parser = _ID3()
+        parser.duration = 10.0
+        parser._chap_frames = [
+            _ChapterFrame('a', 0, 1000, 'A'),
+            _ChapterFrame('b', 1000, 2000, 'B'),
+        ]
+        parser._ctoc_frames = [
+            _ChapterTOC('toc', True, ['a', 'b'], 'TOC'),
+            _ChapterTOC('toc', False, ['a'], 'Duplicate'),
+        ]
+        parser._resolve_id3_chapters()
+        parser._finalize_chapters()
+        self.assertEqual(len(parser.chapters), 2)
+        self.assertIn("duplicate CTOC ID 'toc'", parser.chapter_warnings)
+
+    def test_chapter_missing_from_toc(self) -> None:
+        parser = _ID3()
+        parser.duration = 10.0
+        parser._chap_frames = [
+            _ChapterFrame('a', 0, 1000, 'A'),
+        ]
+        parser._ctoc_frames = [
+            _ChapterTOC('toc', True, ['missing', 'a'], 'TOC'),
+        ]
+        parser._resolve_id3_chapters()
+        parser._finalize_chapters()
+        self.assertEqual(len(parser.chapters), 1)
+        self.assertEqual(parser.chapters[0].title, 'A')
+        self.assertIn("chapter 'missing' is missing",
+                      parser.chapter_warnings)
+
+    def test_chapter_toc_without_top_level(self) -> None:
+        parser = _ID3()
+        parser.duration = 10.0
+        parser._chap_frames = [
+            _ChapterFrame('a', 0, 1000, 'A'),
+            _ChapterFrame('b', 1000, 2000, 'B'),
+        ]
+        parser._ctoc_frames = [
+            _ChapterTOC('toc', False, ['b', 'a'], 'TOC'),
+        ]
+        parser._resolve_id3_chapters()
+        parser._finalize_chapters()
+        self.assertEqual(
+            [chapter.title for chapter in parser.chapters], ['B', 'A'])
+        self.assertIn('no top-level CTOC frame found',
+                      parser.chapter_warnings)
+
+    def test_vorbis_timestamp_parsing(self) -> None:
+        self.assertEqual(
+            _Ogg._parse_vorbis_timestamp('00:00:01.500'), 1.5)
+        self.assertEqual(_Ogg._parse_vorbis_timestamp('01:02:03'), 3723.0)
+        self.assertEqual(_Ogg._parse_vorbis_timestamp('1:30'), 90.0)
+        self.assertEqual(_Ogg._parse_vorbis_timestamp('2.5'), 2.5)
+        self.assertIsNone(_Ogg._parse_vorbis_timestamp(''))
+        self.assertIsNone(_Ogg._parse_vorbis_timestamp('abc'))
+        self.assertIsNone(_Ogg._parse_vorbis_timestamp('1:2:3:4'))
+
+    def test_vorbis_chapter_without_name(self) -> None:
+        chapters, warnings = _Ogg._build_vorbis_chapters(
+            {1: '00:00:00.000', 2: '00:00:05.000'},
+            {2: 'Second'},
+        )
+        self.assertEqual(len(chapters), 2)
+        self.assertIsNone(chapters[0].title)
+        self.assertEqual(chapters[1].title, 'Second')
+        self.assertEqual(warnings, [])
+
+    def test_vorbis_name_without_timestamp(self) -> None:
+        chapters, warnings = _Ogg._build_vorbis_chapters(
+            {1: '00:00:00.000'}, {1: 'First', 2: 'Orphan'})
+        self.assertEqual(len(chapters), 1)
+        self.assertEqual(
+            warnings, ['chapter 2 has a name but no timestamp'])
+
+    def test_chapter_as_dict_excludes_chapters(self) -> None:
+        tag = self.get_tag('chapters_mp4.m4a')
+        self.assertEqual(tag.chapters.as_list()[0]['title'], 'Intro')
+        self.assertNotIn('chapters', tag.as_dict())
+        self.assertNotIn('chapter_warnings', tag.as_dict())
+
+
+class _FailingFile(BytesIO):
+    def seek(self, *args: object) -> int:
+        raise OSError('seek failed')
+
+
+class TestChapterParsingHelpers(TestCase):
+
+    def test_index_atoms(self) -> None:
+        atom = b'\x00\x00\x00\x0cmoov\x00\x00\x00\x00'
+        self.assertEqual(_MP4._index_atoms(atom), {b'moov': b'\x00' * 4})
+        # Truncated atom header
+        self.assertEqual(_MP4._index_atoms(b'\x00\x00'), {})
+        # 64-bit atom size, complete
+        extended = (b'\x00\x00\x00\x01moov'
+                    + (20).to_bytes(8, 'big') + b'\x00' * 4)
+        self.assertEqual(
+            _MP4._index_atoms(extended), {b'moov': b'\x00' * 4})
+        # 64-bit atom size, truncated header
+        self.assertEqual(
+            _MP4._index_atoms(b'\x00\x00\x00\x01moov'), {})
+        # Size smaller than the header
+        self.assertEqual(_MP4._index_atoms(b'\x00\x00\x00\x04moov'), {})
+        # Size larger than the data
+        self.assertEqual(
+            _MP4._index_atoms(b'\x00\x00\x00\x10moov\x00\x00'), {})
+
+    def test_iter_atoms(self) -> None:
+        data = (b'\x00\x00\x00\x08free'
+                + b'\x00\x00\x00\x0ctrakDATA')
+        self.assertEqual(list(_MP4._iter_atoms(data, b'trak')), [b'DATA'])
+        self.assertEqual(
+            list(_MP4._iter_atoms(b'\x00\x00\x00\x01trak', b'trak')), [])
+        self.assertEqual(
+            list(_MP4._iter_atoms(b'\x00\x00\x00\x04trak', b'trak')), [])
+        extended = b'\x00\x00\x00\x01trak' + b'\x00' * 8
+        self.assertEqual(list(_MP4._iter_atoms(extended, b'trak')), [])
+
+    def test_parse_table_helpers(self) -> None:
+        self.assertEqual(_MP4._parse_stsc(b''), [])
+        self.assertEqual(_MP4._parse_stsc(b'\x00' * 8), [])
+        stsc = b'\x00' * 4 + b'\x00\x00\x00\x02'
+        stsc += b'\x00\x00\x00\x01\x00\x00\x00\x03\x00\x00\x00\x01'
+        stsc += b'\x00\x00\x00\x05\x00\x00\x00\x01\x00\x00\x00\x01'
+        self.assertEqual(
+            _MP4._parse_stsc(stsc), [(1, 3), (5, 1)])
+        # Truncated entry stops parsing
+        self.assertEqual(
+            _MP4._parse_stsc(stsc[:-12]), [(1, 3)])
+        self.assertEqual(_MP4._parse_stco(b''), [])
+        stco = b'\x00' * 4 + b'\x00\x00\x00\x02'
+        stco += b'\x00\x00\x00\x2c\x00\x00\x01\x00'
+        self.assertEqual(_MP4._parse_stco(stco), [44, 256])
+        self.assertEqual(_MP4._parse_stco(stco[:-4]), [44])
+        self.assertEqual(_MP4._parse_stts(b''), [])
+        stts = b'\x00' * 4 + b'\x00\x00\x00\x02'
+        stts += b'\x00\x00\x00\x01\x00\x00\x03\xe8'
+        stts += b'\x00\x00\x00\x02\x00\x00\x01\xf4'
+        self.assertEqual(_MP4._parse_stts(stts), [1000, 500, 500])
+        self.assertEqual(_MP4._parse_stts(stts[:-4]), [1000])
+        self.assertEqual(_MP4._parse_stsz(b''), [])
+        uniform = b'\x00' * 4 + b'\x00\x00\x00\x0a' + b'\x00\x00\x00\x03'
+        self.assertEqual(_MP4._parse_stsz(uniform), [10, 10, 10])
+        sizes = b'\x00' * 4 + b'\x00\x00\x00\x00' + b'\x00\x00\x00\x02'
+        sizes += b'\x00\x00\x00\x13\x00\x00\x00\x17'
+        self.assertEqual(_MP4._parse_stsz(sizes), [19, 23])
+        self.assertEqual(_MP4._parse_stsz(sizes[:-4]), [19])
+
+    def test_parse_mdhd_timescale(self) -> None:
+        self.assertEqual(_MP4._parse_mdhd_timescale(b''), 0)
+        version0 = b'\x00' * 12 + b'\x00\x00\x03\xe8' + b'\x00' * 4
+        self.assertEqual(_MP4._parse_mdhd_timescale(version0), 1000)
+        version1 = (b'\x01' + b'\x00' * 19 + b'\x00\x00\x03\xe8'
+                    + b'\x00' * 4)
+        self.assertEqual(_MP4._parse_mdhd_timescale(version1), 1000)
+        self.assertEqual(
+            _MP4._parse_mdhd_timescale(b'\x01' + b'\x00' * 19), 0)
+        self.assertEqual(
+            _MP4._parse_mdhd_timescale(b'\x02' + b'\x00' * 19), 0)
+
+    def test_read_chapter_title(self) -> None:
+        fh = BytesIO(b'\x00' * 4 + b'\x00\x03abc\x0cloudy')
+        self.assertEqual(_MP4._read_chapter_title(fh, 4, 6), 'abc')
+        # Zero-length title
+        self.assertEqual(_MP4._read_chapter_title(BytesIO(b'\x00\x00'), 0,
+                                                  2), None)
+        # Empty sample
+        self.assertEqual(_MP4._read_chapter_title(BytesIO(), 0, 0), None)
+        # Length exceeds the sample
+        self.assertEqual(
+            _MP4._read_chapter_title(BytesIO(b'\x00\x05ab'), 0, 4), None)
+        # File handle errors are ignored
+        self.assertEqual(
+            _MP4._read_chapter_title(_FailingFile(b'ab'), 0, 2), None)
+
+    def test_read_moov_errors(self) -> None:
+        self.assertIsNone(_MP4._read_moov(_FailingFile()))
+        # Missing moov atom
+        self.assertIsNone(_MP4._read_moov(BytesIO(
+            b'\x00\x00\x00\x08free')))
+        # Truncated header
+        self.assertIsNone(_MP4._read_moov(BytesIO(b'\x00\x00')))
+        # Extended size, truncated
+        self.assertIsNone(_MP4._read_moov(BytesIO(b'\x00\x00\x00\x01moov')))
+        # Extended size, valid: 8 byte header, 8 byte size, 4 byte payload
+        data = (b'\x00\x00\x00\x01moov'
+                + (20).to_bytes(8, 'big') + b'\x00' * 4)
+        self.assertEqual(_MP4._read_moov(BytesIO(data)), b'\x00' * 4)
+        # Extended size pointing past the end of the file
+        data = (b'\x00\x00\x00\x01moov'
+                + (100).to_bytes(8, 'big') + b'\x00' * 4)
+        self.assertIsNone(_MP4._read_moov(BytesIO(data)))
+        # Invalid size
+        self.assertIsNone(_MP4._read_moov(BytesIO(b'\x00\x00\x00\x04moov')))
+        # Sanity limit
+        self.assertIsNone(_MP4._read_moov(BytesIO(
+            b'\x00\x00\x00\x01moov' + b'\x00' * 7 + b'\x01' + b'\x00')))
+        # A trailing atom header too short to contain a full size/type
+        self.assertIsNone(_MP4._read_moov(BytesIO(
+            b'\x00\x00\x00\x0cfree' + b'\x00' * 4 + b'\x00' * 4)))
+        # An atom header shorter than its declared 8 bytes
+        self.assertIsNone(_MP4._read_moov(BytesIO(
+            b'\x00\x00\x00\x08free' + b'\x00' * 8)))
+        # End of file without moov
+        self.assertIsNone(_MP4._read_moov(BytesIO(
+            b'\x00\x00\x00\x08free')))
+
+    def test_chapters_from_trak_malformed(self) -> None:
+        self.assertEqual(_MP4._chapters_from_trak(b''), [])
+        # Missing mdia
+        self.assertEqual(_MP4._chapters_from_trak(
+            b'\x00\x00\x00\x08free'), [])
+        # mdia without a text handler
+        hdlr = b'\x00' * 8 + b'soun' + b'\x00' * 4
+        mdia = (b'\x00\x00\x00\x08hdlr' + b'\x00' * 12)
+        trak = b'\x00\x00\x00\x14mdia' + mdia
+        self.assertEqual(_MP4._chapters_from_trak(trak), [])
+        # A short handler
+        trak = (b'\x00\x00\x00\x0chdlr' + b'\x00\x00')
+        mdia = b'\x00\x00\x00\x10mdia' + trak
+        trak = b'\x00\x00\x00\x18trak' + mdia
+        self.assertEqual(_MP4._chapters_from_trak(trak), [])
+        self.assertEqual(_MP4._chapters_from_trak(
+            b'\x00\x00\x00\x08mdia'), [])
+
+    def test_parse_chpl_malformed(self) -> None:
+        def parse(data: bytes) -> list[tuple[str, object]]:
+            return list(_MP4._parse_chpl(data))
+
+        def header(count: int, version: int = 1) -> bytes:
+            # version/flags (4), reserved (4), chapter count (1)
+            return (bytes([version]) + b'\x00' * 7
+                    + bytes([count]))
+
+        self.assertEqual(
+            parse(b'\x01'), [('chapter_warning', 'truncated chpl atom')])
+        self.assertEqual(
+            parse(header(0, version=2)),
+            [('chapter_warning', 'unknown chpl version 2')])
+        # Chapter count says 3, only one entry present
+        self.assertIn(
+            ('chapter_warning', 'truncated chpl chapter entry'),
+            parse(header(3) + b'\x00' * 8 + b'\x01I'))
+        # Title length exceeds the data
+        self.assertEqual(
+            parse(header(1) + b'\x00' * 8 + b'\x09I'),
+            [('chapter_warning', 'truncated chpl chapter title')])
+        # A zero chapter count produces no chapters
+        self.assertEqual(parse(header(0)), [])
+        # A valid entry
+        self.assertEqual(
+            parse(header(1) + b'\x00' * 8 + b'\x03abc'),
+            [('chapters', [Chapter('abc', 0.0, None, 0)])])
+
+    def test_parse_chapter_frame_malformed(self) -> None:
+        parser = _ID3()
+        parser._parse_chapter_frame(b'CHAP', b'no terminator')
+        self.assertIn('truncated CHAP frame', parser.chapter_warnings)
+        parser = _ID3()
+        parser._parse_chapter_frame(b'CTOC', b'id\x00\x03')
+        self.assertIn("truncated CTOC frame 'id'", parser.chapter_warnings)
+        parser = _ID3()
+        parser._parse_chapter_frame(b'CTOC', b'id\x00\x03\x02child')
+        self.assertIn("truncated CTOC frame 'id'", parser.chapter_warnings)
+        parser = _ID3()
+        parser._parse_chapter_frame(
+            b'CHAP', b'id\x00' + b'\xff' * 16)
+        self.assertIn("CHAP frame 'id' has no start time",
+                      parser.chapter_warnings)
+        self.assertEqual(parser.chapters, [])
+
+    def test_parse_subframes_v22_and_truncated(self) -> None:
+        parser = _ID3()
+        v22 = parser._parse_subframes(b'TIT\x00\x00\x03\x03Hi', 2)
+        self.assertEqual(list(v22), [(b'TIT', b'\x03Hi')])
+        v23 = parser._parse_subframes(b'TIT2\x00\x00\x00\x03\x00\x00Hi!', 4)
+        self.assertEqual(list(v23), [(b'TIT2', b'Hi!')])
+        # Truncated subframe (size exceeds data)
+        self.assertEqual(
+            list(parser._parse_subframes(
+                b'TIT2\x00\x00\x00\x09\x00\x00Hi', 4)), [])
+        # Empty subframe ID terminates parsing
+        self.assertEqual(
+            list(parser._parse_subframes(b'\x00' * 10, 4)), [])
+
+    def test_update_copies_chapters(self) -> None:
+        source = _ID3()
+        source._chapters = Chapters([
+            Chapter('One', 0.0, 1.0, 0)])
+        source._chapter_warnings = ['warning']
+        target = _ID3()
+        target._update(source)
+        self.assertEqual(len(target.chapters), 1)
+        self.assertEqual(target.chapter_warnings, ['warning'])
+
+    def test_finalize_negative_duration_and_times(self) -> None:
+        parser = _ID3()
+        parser.duration = -1.0
+        parser._chapters = Chapters([
+            Chapter('Negative', -1.0, 1.0, 0),
+            Chapter('Overlap', 0.5, 0.9, 1),
+        ])
+        parser._finalize_chapters()
+        self.assertIn('chapter 0 starts before the audio',
+                      parser.chapter_warnings)
+        self.assertIn('chapter 1 overlaps the previous chapter',
+                      parser.chapter_warnings)
+
+    def test_quicktime_chapter_track_edge_cases(self) -> None:
+        def atom(atom_type: bytes, payload: bytes) -> bytes:
+            return (len(payload) + 8).to_bytes(4, 'big') + atom_type + payload
+
+        def table(count: int, *values: int) -> bytes:
+            return (b'\x00' * 4 + count.to_bytes(4, 'big')
+                    + b''.join(value.to_bytes(4, 'big')
+                               for value in values))
+
+        hdlr = atom(b'hdlr', b'\x00' * 8 + b'text' + b'\x00' * 4)
+        mdhd = atom(b'mdhd', b'\x00' * 12 + (1000).to_bytes(4, 'big')
+                    + b'\x00' * 4)
+        mdhd_zero = atom(b'mdhd', b'\x00' * 20)
+        stts = atom(b'stts', table(1, 1, 1000))
+        stsz = atom(b'stsz', table(0, 1, 5))
+        empty_stsz = atom(b'stsz', table(0, 0, 0))
+
+        def stbl(inner: bytes) -> bytes:
+            return atom(b'stbl', inner)
+
+        def minf(inner: bytes) -> bytes:
+            return atom(b'minf', inner)
+
+        def chapters(inner: bytes) -> Chapters:
+            return _MP4._chapters_from_trak(atom(b'mdia', inner))
+
+        # A track without a minf atom
+        self.assertEqual(chapters(hdlr + mdhd), [])
+        # A minf atom without stbl
+        self.assertEqual(chapters(hdlr + mdhd + minf(b'')), [])
+        # Missing mdhd
+        self.assertEqual(chapters(hdlr + minf(stbl(b''))), [])
+        # Missing time scale
+        self.assertEqual(
+            chapters(hdlr + mdhd_zero + minf(stbl(stts + stsz))), [])
+        # Durations missing
+        self.assertEqual(chapters(hdlr + mdhd + minf(stbl(stsz))), [])
+        # Empty sample table
+        self.assertEqual(
+            chapters(hdlr + mdhd + minf(stbl(stts + empty_stsz))), [])
+        # Valid track without a file handle: titles are left unset
+        result = chapters(hdlr + mdhd + minf(stbl(stts + stsz)))
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].start, 0.0)
+        self.assertIsNone(result[0].title)
+        # Non-text tracks are ignored
+        sound_hdlr = atom(b'hdlr', b'\x00' * 8 + b'soun' + b'\x00' * 4)
+        self.assertEqual(
+            chapters(sound_hdlr + mdhd + minf(stbl(stts + stsz))), [])
+        # Empty chunk tables
+        fh = BytesIO(b'\x00' * 4)
+        self.assertEqual(
+            _MP4._read_chapter_titles(fh, b'', b'', [5]), [None])
+        self.assertEqual(
+            _MP4._read_chapter_titles(fh, table(1, 1, 1), table(0, 0), [5]),
+            [None])
+        # More samples than chunks: trailing titles stay unset
+        titles = _MP4._read_chapter_titles(
+            fh, table(1, 1, 1), table(1, 0), [2, 2])
+        self.assertEqual(titles, [None, None])
+        # More per-chunk samples than expected stops at the sample count
+        titles = _MP4._read_chapter_titles(
+            fh, table(1, 1, 5), table(1, 0), [2])
+        self.assertEqual(titles, [None])
+        # Each text sample is a 2 byte length plus the title. The second
+        # chunk mapping entry is used for the second chunk.
+        data = b'\x00\x02ab\x00\x02cd'
+        stsc = table(2, 1, 1, 1, 2, 1, 1)  # (first, per_chunk, desc)
+        titles = _MP4._read_chapter_titles(
+            BytesIO(data), stsc, table(2, 0, 4), [4, 4])
+        self.assertEqual(titles, ['ab', 'cd'])
+        # A chunk map that describes more samples than the sample table
+        # stops reading, and missing trailing titles are padded with None.
+        titles = _MP4._read_chapter_titles(
+            fh, table(1, 1, 9, 1), table(1, 0), [4])
+        self.assertEqual(titles, [None])
+        titles = _MP4._read_chapter_titles(
+            fh, table(1, 1, 1, 1), table(1, 0), [4, 4, 4])
+        self.assertEqual(titles, [None, None, None])
+
+    def test_parse_chapter_track_no_moov(self) -> None:
+        parser = _MP4()
+        parser._filehandler = BytesIO(b'\x00\x00\x00\x08free')
+        parser._parse_chapter_track(parser._filehandler)
+        self.assertEqual(parser.chapters, [])
+        parser._filehandler = _FailingFile()
+        parser._parse_chapter_track(parser._filehandler)
+        self.assertEqual(parser.chapters, [])
+        # A moov without any trak atom is ignored
+        moov = b'\x00\x00\x00\x08free'
+        parser._filehandler = BytesIO(
+            (len(moov) + 8).to_bytes(4, 'big') + b'moov' + moov)
+        parser._parse_chapter_track(parser._filehandler)
+        self.assertEqual(parser.chapters, [])
+
+    def test_toc_duplicate_entry_and_expanded_node(self) -> None:
+        parser = _ID3()
+        parser.duration = 10.0
+        parser._chap_frames = [
+            _ChapterFrame('a', 0, 1000, 'A'),
+            _ChapterFrame('b', 1000, 2000, 'B'),
+        ]
+        parser._ctoc_frames = [
+            _ChapterTOC('toc', True, ['a', 'a', 'part'], 'TOC'),
+            _ChapterTOC('part', False, ['b'], 'Part'),
+            _ChapterTOC('other', True, ['part'], 'Other'),
+        ]
+        parser._resolve_id3_chapters()
+        self.assertIn("duplicate CTOC entry 'a'", parser.chapter_warnings)
+        # The second root referencing an already expanded TOC is skipped.
+        self.assertEqual(len(parser.chapters), 2)
+
+    def test_flac_vorbis_chapters(self) -> None:
+        # FLAC stores Vorbis comments the same way as Ogg.
+        path = os.path.join(SAMPLE_FOLDER, 'unsynced_lyrics.flac')
+        tag = TinyTag.get(path)
+        self.assertEqual(tag.chapters, [])
+        self.assertEqual(tag.chapter_warnings, [])
+
+    def test_chapter_duration_without_end(self) -> None:
+        self.assertIsNone(Chapter('No end', 1.0).duration)
+        self.assertNotEqual(Chapter('A', 0.0), object())
+
+    def test_flac_chapter_warnings_and_images(self) -> None:
+        import struct as _struct
+
+        def block(block_type: int, payload: bytes) -> bytes:
+            return bytes([block_type]) + len(payload).to_bytes(3, 'big') \
+                + payload
+
+        # A Vorbis comment block with a bad timestamp and a picture block.
+        comments = [b'CHAPTER001=garbage', b'CHAPTER001NAME=Bad']
+        vorbis = _struct.pack('<I', 0) + _struct.pack('<I', len(comments))
+        for comment in comments:
+            vorbis += _struct.pack('<I', len(comment)) + comment
+        # FLAC Vorbis comment blocks have no framing bit.
+        picture = (_struct.pack('>I', 3)
+                   + _struct.pack('>I', 9) + b'image/png'
+                   + _struct.pack('>I', 0)
+                   + _struct.pack('>IIII', 1, 1, 24, 0)
+                   + _struct.pack('>I', 4) + b'PNG!')
+        stream = (b'fLaC' + block(0x04, vorbis)
+                  + block(0x86, picture) + b'\x00' * 8)
+        tag = _Flac.get(file_obj=BytesIO(stream), image=True)
+        self.assertEqual(tag.chapters, [])
+        self.assertIn("invalid chapter timestamp 'garbage'",
+                      tag.chapter_warnings)
+        self.assertIsNotNone(tag.images.any)
+        # A picture embedded in a Vorbis comment block is exposed too.
+        import base64
+        encoded = base64.b64encode(picture)
+        comments = [b'METADATA_BLOCK_PICTURE=' + encoded]
+        vorbis = _struct.pack('<I', 0) + _struct.pack('<I', len(comments))
+        for comment in comments:
+            vorbis += _struct.pack('<I', len(comment)) + comment
+        stream = (b'fLaC' + block(0x84, vorbis) + b'\x00' * 8)
+        tag = _Flac.get(file_obj=BytesIO(stream), image=True)
+        self.assertEqual(tag.chapters, [])
+        self.assertIsNotNone(tag.images.any)
+
+    def test_chapter_values_from_atom_tree(self) -> None:
+        class ChapterTreeTag(_MP4):
+            @classmethod
+            def _build_combined_tree(cls) -> Any:
+                return {b'chap': cls._chapter_test_parser}
+
+            @classmethod
+            def _chapter_test_parser(cls, data: bytes) -> Any:
+                yield 'chapters', Chapters([Chapter('One', 0.0, 1.0, 0)])
+                yield 'chapter_warning', 'test warning'
+
+        # A top-level atom is parsed by the callable leaf.
+        stream = BytesIO(b'\x00\x00\x00\x08chap')
+        tag = ChapterTreeTag.get(file_obj=stream)
+        self.assertEqual(len(tag.chapters), 1)
+        self.assertEqual(tag.chapters[0].title, 'One')
+        self.assertEqual(tag.chapter_warnings, ['test warning'])
+
+    def test_read_moov_defensive_limits(self) -> None:
+        class _ShortReadFile(BytesIO):
+            def read(self, size: int | None = -1) -> bytes:
+                return b'\x00' * 4
+
+            def seek(self, offset: int, whence: int = 0) -> int:
+                if whence == 2:
+                    return 64
+                return super().seek(offset, whence)
+
+        class _HugeFile(BytesIO):
+            def __init__(self) -> None:
+                # Declared size is just above the 64 MiB sanity limit.
+                super().__init__(
+                    (9 + (1 << 26)).to_bytes(4, 'big') + b'moov')
+
+            def seek(self, offset: int, whence: int = 0) -> int:
+                if whence == 2:
+                    return 9 + (1 << 26)
+                return super().seek(offset, whence)
+
+        # A file handle that never returns a full atom header.
+        self.assertIsNone(_MP4._read_moov(_ShortReadFile()))
+        # A moov atom larger than the sanity limit is not read into memory.
+        huge = _HugeFile()
+        self.assertEqual(huge.seek(0, 2), 9 + (1 << 26))
+        self.assertIsNone(_MP4._read_moov(huge))
+
+    def test_flac_with_chapter_comments(self) -> None:
+        # FLAC reuses the Vorbis comment parser, including chapters.
+        import struct as _struct
+        vorbis_block = _struct.pack('<I', 0)  # vendor length
+        comments = [b'CHAPTER001=00:00:00.000', b'CHAPTER001NAME=One',
+                    b'CHAPTER002=00:00:01.000', b'CHAPTER002NAME=Two']
+        vorbis_block += _struct.pack('<I', len(comments))
+        for comment in comments:
+            vorbis_block += _struct.pack('<I', len(comment)) + comment
+        header = b'fLaC'
+        header += bytes([0x84]) + (len(vorbis_block)).to_bytes(3, 'big')
+        stream = header + vorbis_block + b'\x00' * 64
+        tag = TinyTag.get(file_obj=BytesIO(stream))
+        self.assertIsInstance(tag, _Flac)
+        self.assertEqual(len(tag.chapters), 2)
+        self.assertEqual(tag.chapters[0].title, 'One')
+        self.assertEqual(tag.chapters[1].start, 1.0)

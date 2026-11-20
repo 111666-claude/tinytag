@@ -54,7 +54,12 @@ def _print_tag(tag: TinyTag, fmt: str, header_printed: bool = False) -> bool:
     data = tag.as_dict()
     if fmt == 'json':
         import json  # pylint: disable=import-outside-toplevel
-        print(json.dumps(data, ensure_ascii=False, indent=2))
+        result: dict[str, object] = dict(data)
+        if tag.chapters:
+            result['chapters'] = tag.chapters.as_list()
+        if tag.chapter_warnings:
+            result['chapter_warnings'] = list(tag.chapter_warnings)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
         return header_printed
     if fmt not in {'csv', 'tsv', 'tabularcsv'}:
         return header_printed

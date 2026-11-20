@@ -34,6 +34,7 @@ from __future__ import annotations
 from binascii import a2b_base64
 from io import BytesIO
 from os import PathLike, SEEK_CUR, SEEK_END, environ, fsdecode
+from re import compile as re_compile
 from struct import unpack, unpack_from
 
 TYPE_CHECKING = False
@@ -48,7 +49,10 @@ if TYPE_CHECKING:
     _AtomParser = Callable[
         [bytes],
         Iterator[
-            Tuple[str, Union[str, float, List[str], 'Image']]
+            Tuple[
+                str,
+                Union[str, float, List[str], 'Image', 'Chapters']
+            ]
         ]
     ]
     _AtomTreeDict = Dict[bytes, Union['_AtomTreeDict', _AtomParser]]
@@ -113,6 +117,8 @@ class TinyTag:
         self.images = Images()
         self.other = OtherFields()
 
+        self._chapters = Chapters()
+        self._chapter_warnings: list[str] = []
         self._filehandler: BinaryIO | None = None
         self._default_encoding: str | None = None  # override for some formats
         self._parse_duration = True
@@ -192,7 +198,7 @@ class TinyTag:
         for key, value in self.__dict__.items():
             if key.startswith('_'):
                 continue
-            if isinstance(value, Images):
+            if isinstance(value, (Images, Chapters)):
                 continue
             if not isinstance(value, OtherFields):
                 if value is None:
@@ -209,6 +215,16 @@ class TinyTag:
                 else:
                     other_fields += other_values
         return fields
+
+    @property
+    def chapters(self) -> Chapters:
+        """Chapters stored in the file, in their original order."""
+        return self._chapters
+
+    @property
+    def chapter_warnings(self) -> list[str]:
+        """Non-fatal problems found while reading chapters."""
+        return self._chapter_warnings
 
     @classmethod
     def _get_parser_for_filename(cls, filename: str) -> type[TinyTag] | None:
@@ -297,6 +313,8 @@ class TinyTag:
             return
         if tags or duration:
             self._parse(self._filehandler)
+        if tags:
+            self._finalize_chapters()
 
     def _set_field(self, fieldname: str, value: str | float) -> None:
         if isinstance(value, str) and not value:
@@ -345,6 +363,11 @@ class TinyTag:
                 self.images._update(value)  # pylint: disable=protected-access
             elif value is not None:
                 self._set_field(key, value)
+        if other._chapters:
+            self._chapters = Chapters(other._chapters)
+        for warning in other._chapter_warnings:
+            if warning not in self._chapter_warnings:
+                self._chapter_warnings.append(warning)
 
     @staticmethod
     def _unpad(s: str) -> str:
@@ -354,6 +377,60 @@ class TinyTag:
     @staticmethod
     def _unpad_bytes(s: bytes) -> bytes:
         return s.rstrip(b'\x00')
+
+    def _set_chapters(self, chapters: list[Chapter]) -> None:
+        # Re-index chapters and preserve the storage order.
+        self._chapters = Chapters()
+        for index, chapter in enumerate(chapters):
+            chapter.index = index
+            self._chapters.append(chapter)
+
+    def _finalize_chapters(self) -> None:
+        """Validate chapter times and derive missing end times."""
+        if not self._chapters:
+            return
+        duration = self.duration
+        if duration is not None and duration < 0:
+            duration = None
+
+        def _warn(message: str) -> None:
+            if message not in self._chapter_warnings:
+                self._chapter_warnings.append(message)
+
+        # Keep the original order so that the chapter list matches the file,
+        # but flag anomalies instead of dropping data.
+        for chapter in self._chapters:
+            if chapter.start < 0:
+                _warn(f'chapter {chapter.index} starts before the audio')
+            if duration is not None and chapter.start > duration:
+                _warn(f'chapter {chapter.index} starts beyond the audio')
+            if chapter.end is None:
+                continue
+            if chapter.end < chapter.start:
+                _warn(f'chapter {chapter.index} ends before it starts')
+                chapter.end = None
+            elif duration is not None and chapter.end > duration:
+                _warn(f'chapter {chapter.index} ends beyond the audio')
+        previous_start: float | None = None
+        previous_end: float | None = None
+        for chapter in self._chapters:
+            if previous_start is not None:
+                if chapter.start < previous_start:
+                    _warn(f'chapter {chapter.index} is out of order')
+                elif (previous_end is not None
+                        and chapter.start < previous_end):
+                    _warn(f'chapter {chapter.index} overlaps the previous '
+                          'chapter')
+            previous_start = chapter.start
+            previous_end = chapter.end
+        for index, chapter in enumerate(self._chapters):
+            if chapter.end is not None:
+                continue
+            if (index + 1 < len(self._chapters)
+                    and self._chapters[index + 1].start >= chapter.start):
+                chapter.end = self._chapters[index + 1].start
+            elif duration is not None and duration >= chapter.start:
+                chapter.end = duration
 
     def get_image(self) -> bytes | None:
         """Deprecated, use 'images.any' instead."""
@@ -488,6 +565,95 @@ class OtherImages(_ImageListDict):
     """A dictionary containing additional images embedded in an audio file."""
 
 
+class Chapter:
+    """A chapter of an audio file.
+
+    Attributes:
+        title: human-readable chapter title, or None when the file does not
+            provide one
+        start: start time in seconds from the beginning of the audio
+        end: end time in seconds, or None when unknown
+        index: zero-based position in the chapter list, matching the order
+            chapters have been stored in the file
+    """
+
+    def __init__(self,
+                 title: str | None,
+                 start: float,
+                 end: float | None = None,
+                 index: int = 0) -> None:
+        self.title = title
+        self.start = start
+        self.end = end
+        self.index = index
+
+    @property
+    def duration(self) -> float | None:
+        """Chapter duration in seconds, if known."""
+        if self.end is None:
+            return None
+        return self.end - self.start
+
+    def as_dict(self) -> dict[str, str | float | int | None]:
+        """Return a dictionary representation of the chapter."""
+        return {
+            'title': self.title,
+            'start': self.start,
+            'end': self.end,
+            'index': self.index
+        }
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Chapter):
+            return NotImplemented
+        return (self.title, self.start, self.end, self.index) == (
+            other.title, other.start, other.end, other.index)
+
+    def __hash__(self) -> int:
+        return hash((self.title, self.start, self.end, self.index))
+
+    def __repr__(self) -> str:
+        return (f'{type(self).__name__}(title={self.title!r}, '
+                f'start={self.start!r}, end={self.end!r}, '
+                f'index={self.index!r})')
+
+
+class Chapters(list):  # type: ignore[type-arg]
+    """A list of chapters, ordered as stored in the file."""
+
+    def as_list(self) -> list[dict[str, str | float | int | None]]:
+        """Return a list of dictionary representations of the chapters."""
+        return [chapter.as_dict() for chapter in self]
+
+
+class _ChapterFrame:
+    """Intermediate representation of an ID3 CHAP frame."""
+
+    def __init__(self,
+                 element_id: str,
+                 start_ms: int,
+                 end_ms: int | None,
+                 title: str | None) -> None:
+        self.element_id = element_id
+        self.start_ms = start_ms
+        self.end_ms = end_ms
+        self.title = title
+
+
+class _ChapterTOC:
+    """Intermediate representation of an ID3 CTOC frame."""
+
+    def __init__(self,
+                 element_id: str,
+                 top_level: bool,
+                 children: list[str],
+                 title: str | None) -> None:
+        self.element_id = element_id
+        self.top_level = top_level
+        self.children = children
+        self.title = title
+
+
 class _MP4(TinyTag):
     """MP4 Audio Parser.
 
@@ -550,6 +716,10 @@ class _MP4(TinyTag):
         elif self._parse_tags:
             tree = self._build_meta_data_tree()
         self._traverse_atoms(fh, path=tree)
+        if self._parse_tags and not self._chapters:
+            # Some files only carry a QuickTime chapter track, and no
+            # Nero 'chpl' atom. Fall back to the chapter track.
+            self._parse_chapter_track(fh)
         self._duration_parsed = self._parse_duration
         self._tags_parsed = self._parse_tags
 
@@ -607,7 +777,7 @@ class _MP4(TinyTag):
                 b'tmpo': {b'data': _MP4._data_parser('other.bpm')},
                 b'covr': {b'data': _MP4._parse_cover_image},
                 b'----': _MP4._parse_custom_field,
-            }}}}, b'uuid': _MP4._parse_uuid}
+            }}, b'chpl': _MP4._parse_chpl}}, b'uuid': _MP4._parse_uuid}
         return cls._meta_data_tree
 
     @classmethod
@@ -691,12 +861,17 @@ class _MP4(TinyTag):
                         if _DEBUG:
                             print(' ' * 4 * len(curr_path), 'FIELD: ',
                                   fieldname)
-                        if isinstance(value, Image):
+                        if isinstance(value, Chapters):
+                            self._set_chapters(value)
+                        elif isinstance(value, Image):
                             # pylint: disable=protected-access
                             self.images._set_field(fieldname, value)
                         elif isinstance(value, list):
                             for subval in value:
-                                self._set_field(fieldname, subval)
+                                if isinstance(subval, str):
+                                    self._set_field(fieldname, subval)
+                        elif fieldname == 'chapter_warning':
+                            self._chapter_warnings.append(str(value))
                         elif fieldname == 'codec':
                             self.mime_type = f'audio/mp4; codecs="{value}"'
                         else:
@@ -894,6 +1069,299 @@ class _MP4(TinyTag):
         if samplerate:
             yield 'samplerate', samplerate
 
+    @staticmethod
+    def _parse_stsc(data: bytes) -> list[tuple[int, int]]:
+        if len(data) < 8:
+            return []
+        count = unpack_from('>I', data, 4)[0]
+        chunks: list[tuple[int, int]] = []
+        offset = 8
+        for _i in range(count):
+            if offset + 12 > len(data):
+                break
+            first_chunk, per_chunk, _desc = unpack_from(
+                '>III', data, offset)
+            offset += 12
+            chunks.append((first_chunk, per_chunk))
+        return chunks
+
+    @staticmethod
+    def _parse_stco(data: bytes) -> list[int]:
+        if len(data) < 8:
+            return []
+        count = unpack_from('>I', data, 4)[0]
+        offsets: list[int] = []
+        offset = 8
+        for _i in range(count):
+            if offset + 4 > len(data):
+                break
+            offsets.append(unpack_from('>I', data, offset)[0])
+            offset += 4
+        return offsets
+
+    @classmethod
+    def _chapters_from_trak(cls,
+                            data: bytes,
+                            fh: BinaryIO | None = None) -> Chapters:
+        atoms = cls._index_atoms(data)
+        mdia = atoms.get(b'mdia')
+        if mdia is None:
+            return Chapters()
+        mdia_atoms = cls._index_atoms(mdia)
+        hdlr = mdia_atoms.get(b'hdlr')
+        if hdlr is None or len(hdlr) < 12 or hdlr[8:12] != b'text':
+            return Chapters()
+        minf = mdia_atoms.get(b'minf')
+        if minf is None:
+            return Chapters()
+        stbl = cls._index_atoms(minf).get(b'stbl')
+        if stbl is None:
+            return Chapters()
+        stbl_atoms = cls._index_atoms(stbl)
+        stts = stbl_atoms.get(b'stts')
+        stsz = stbl_atoms.get(b'stsz')
+        mdhd = mdia_atoms.get(b'mdhd')
+        if stts is None or stsz is None or mdhd is None:
+            return Chapters()
+        time_scale = cls._parse_mdhd_timescale(mdhd)
+        if not time_scale:
+            return Chapters()
+        durations = cls._parse_stts(stts)
+        sample_sizes = cls._parse_stsz(stsz)
+        if not sample_sizes or len(durations) < len(sample_sizes):
+            return Chapters()
+        titles: list[str | None] = [None] * len(sample_sizes)
+        if fh is not None:
+            stco = stbl_atoms.get(b'stco')
+            stsc = stbl_atoms.get(b'stsc')
+            if stco is not None and stsc is not None:
+                titles = cls._read_chapter_titles(
+                    fh, stsc, stco, sample_sizes)
+        chapters = Chapters()
+        timestamp = 0
+        for index, duration in enumerate(durations[:len(sample_sizes)]):
+            chapters.append(Chapter(
+                title=titles[index],
+                start=timestamp / time_scale,
+                end=None,
+                index=index
+            ))
+            timestamp += duration
+        return chapters
+
+    @classmethod
+    def _read_chapter_titles(cls,
+                             fh: BinaryIO,
+                             stsc: bytes,
+                             stco: bytes,
+                             sample_sizes: list[int]) -> list[str | None]:
+        chunk_offsets = cls._parse_stco(stco)
+        chunk_map = cls._parse_stsc(stsc)
+        if not chunk_offsets or not chunk_map:
+            return [None] * len(sample_sizes)
+        titles: list[str | None] = []
+        sample_index = 0
+        current_map = 0
+        for chunk_index, chunk_offset in enumerate(chunk_offsets, start=1):
+            while (current_map + 1 < len(chunk_map)
+                    and chunk_map[current_map + 1][0] <= chunk_index):
+                current_map += 1
+            per_chunk = chunk_map[current_map][1]
+            offset = chunk_offset
+            for _i in range(per_chunk):
+                if sample_index >= len(sample_sizes):
+                    return titles
+                titles.append(cls._read_chapter_title(
+                    fh, offset, sample_sizes[sample_index]))
+                offset += sample_sizes[sample_index]
+                sample_index += 1
+        while len(titles) < len(sample_sizes):
+            titles.append(None)
+        return titles
+
+    @staticmethod
+    def _read_chapter_title(fh: BinaryIO,
+                            offset: int,
+                            size: int) -> str | None:
+        try:
+            fh.seek(offset)
+            sample = fh.read(size)
+        except OSError:
+            return None
+        if len(sample) < 2:
+            return None
+        text_len = unpack_from('>H', sample)[0]
+        if text_len == 0 or text_len + 2 > len(sample):
+            return None
+        # Ignore the optional text modifier that follows the title
+        return sample[2:2 + text_len].decode('utf-8', 'replace') or None
+
+    def _parse_chapter_track(self, fh: BinaryIO) -> None:
+        # Locate a QuickTime chapter track in the moov atom, if any.
+        try:
+            fh.seek(0)
+        except OSError:
+            return
+        moov = self._read_moov(fh)
+        if moov is None:
+            return
+        for trak in self._iter_atoms(moov, b'trak'):
+            chapters = self._chapters_from_trak(trak, fh)
+            if chapters:
+                self._set_chapters(chapters)
+                return
+
+    @classmethod
+    def _read_moov(cls, fh: BinaryIO) -> bytes | None:
+        try:
+            file_size = fh.seek(0, SEEK_END)
+            fh.seek(0)
+        except OSError:
+            return None
+        offset = 0
+        while offset + 8 <= file_size:
+            fh.seek(offset)
+            header = fh.read(8)
+            if len(header) < 8:
+                return None
+            size = unpack_from('>I', header)[0]
+            atom_type = header[4:8]
+            header_size = 8
+            if size == 1:
+                ext = fh.read(8)
+                if len(ext) < 8:
+                    return None
+                size = unpack_from('>Q', ext)[0]
+                header_size = 16
+            if size < header_size or offset + size > file_size:
+                return None
+            if atom_type == b'moov':
+                payload_size = size - header_size
+                if payload_size > 1 << 26:  # Sanity limit: 64 MiB
+                    return None
+                return fh.read(payload_size)
+            offset += size
+        return None
+
+    @staticmethod
+    def _iter_atoms(data: bytes, atom_type: bytes) -> Iterator[bytes]:
+        offset = 0
+        data_length = len(data)
+        while offset + 8 <= data_length:
+            size = unpack_from('>I', data, offset)[0]
+            current_type = data[offset + 4:offset + 8]
+            header_size = 8
+            if size == 1:
+                if offset + 16 > data_length:
+                    return
+                size = unpack_from('>Q', data, offset + 8)[0]
+                header_size = 16
+            if size < header_size or offset + size > data_length:
+                return
+            if current_type == atom_type:
+                yield data[offset + header_size:offset + size]
+            offset += size
+
+    @staticmethod
+    def _index_atoms(data: bytes) -> dict[bytes, bytes]:
+        atoms: dict[bytes, bytes] = {}
+        offset = 0
+        data_length = len(data)
+        while offset + 8 <= data_length:
+            size = unpack_from('>I', data, offset)[0]
+            atom_type = data[offset + 4:offset + 8]
+            header_size = 8
+            if size == 1:
+                if offset + 16 > data_length:
+                    break
+                size = unpack_from('>Q', data, offset + 8)[0]
+                header_size = 16
+            if size < header_size or offset + size > data_length:
+                break
+            atoms.setdefault(
+                atom_type, data[offset + header_size:offset + size])
+            offset += size
+        return atoms
+
+    @staticmethod
+    def _parse_mdhd_timescale(data: bytes) -> int:
+        if len(data) < 20:
+            return 0
+        version = data[0]
+        if version == 0:
+            return int(unpack_from('>I', data, 12)[0])
+        if version == 1 and len(data) >= 24:
+            return int(unpack_from('>I', data, 20)[0])
+        return 0
+
+    @staticmethod
+    def _parse_stts(data: bytes) -> list[int]:
+        if len(data) < 8:
+            return []
+        count = unpack_from('>I', data, 4)[0]
+        durations: list[int] = []
+        offset = 8
+        for _i in range(count):
+            if offset + 8 > len(data):
+                break
+            sample_count, delta = unpack_from('>II', data, offset)
+            offset += 8
+            durations.extend([delta] * min(sample_count, 1000))
+        return durations
+
+    @staticmethod
+    def _parse_stsz(data: bytes) -> list[int]:
+        if len(data) < 12:
+            return []
+        sample_size, count = unpack_from('>II', data, 4)
+        if sample_size:
+            return [sample_size] * min(count, 1000)
+        sizes: list[int] = []
+        offset = 12
+        for _i in range(min(count, 1000)):
+            if offset + 4 > len(data):
+                break
+            sizes.append(unpack_from('>I', data, offset)[0])
+            offset += 4
+        return sizes
+
+    @classmethod
+    def _parse_chpl(cls, data: bytes) -> Iterator[
+        tuple[str, str | Chapters]
+    ]:
+        # The chpl atom contains a Nero chapter list:
+        # https://github.com/FFmpeg/FFmpeg/blob/master/libavformat/mov.c
+        # https://mutagen.readthedocs.io/en/latest/api/mp4.html
+        if len(data) < 9:
+            yield 'chapter_warning', 'truncated chpl atom'
+            return
+        version = data[0]
+        if version not in (0, 1):
+            yield 'chapter_warning', f'unknown chpl version {version}'
+            return
+        count = data[8]
+        offset = 9
+        chapters = Chapters()
+        for index in range(count):
+            # Each entry is an 8-byte timestamp, a 1-byte title length and
+            # the title itself.
+            if offset + 9 > len(data):
+                yield 'chapter_warning', 'truncated chpl chapter entry'
+                break
+            title_len = data[offset + 8]
+            if offset + 9 + title_len > len(data):
+                yield 'chapter_warning', 'truncated chpl chapter title'
+                break
+            # Timestamps are stored in 100 nanosecond units.
+            start = unpack_from('>Q', data, offset)[0] / 10000000
+            raw_title = data[offset + 9:offset + 9 + title_len]
+            offset += 9 + title_len
+            title = raw_title.decode('utf-8', 'replace') or None
+            chapters.append(Chapter(
+                title=title, start=start, end=None, index=index))
+        if chapters:
+            yield 'chapters', chapters
+
     @classmethod
     def _parse_mvhd(cls, data: bytes) -> Iterator[tuple[str, float]]:
         # http://stackoverflow.com/a/3639993/1191373
@@ -957,6 +1425,8 @@ class _ID3(TinyTag):
     _IMAGE_FRAME_IDS = {b'APIC', b'PIC'}
     _CUSTOM_FRAME_IDS = {b'TXXX', b'TXX'}
     _SYNCED_LYRICS_FRAME_IDS = {b'SYLT', b'SLT'}
+    _CHAPTER_FRAME_IDS = {b'CHAP', b'CTOC'}
+    _CHAPTER_TITLE_FRAME_IDS = {b'TIT2', b'TT2'}
     _IGNORED_FRAME_IDS = {
         b'AENC', b'CRA',
         b'APIC', b'PIC',
@@ -1068,6 +1538,8 @@ class _ID3(TinyTag):
         self._only_id3 = False
         self._modern_grouping_values: list[str] = []
         self._legacy_grouping_values: list[str] = []
+        self._chap_frames: list[_ChapterFrame] = []
+        self._ctoc_frames: list[_ChapterTOC] = []
 
     def _parse(self, fh: BinaryIO) -> None:
         audio_offset = fh.tell()
@@ -1144,6 +1616,7 @@ class _ID3(TinyTag):
                 break
             parsed_size += frame_size
         self._set_grouping_work_fields()
+        self._resolve_id3_chapters()
         return size
 
     def _parse_id3v1(self, fh: BinaryIO) -> bool:
@@ -1291,6 +1764,185 @@ class _ID3(TinyTag):
             lyrics += f'[{timestamp}]{value}'
         return lyrics
 
+    def _parse_chapter_frame(self,
+                             frame_id: bytes,
+                             content: bytes,
+                             id3version: int | None = None) -> None:
+        # https://mutagen-specs.readthedocs.io/en/latest/id3/id3v2-chapters-1.0.html
+        element_id, offset = self._read_chapter_string(content)
+        if element_id is None:
+            self._chapter_warnings.append(
+                f'truncated {frame_id.decode("latin-1")} frame')
+            return
+        if frame_id == b'CHAP':
+            if offset + 16 > len(content):
+                self._chapter_warnings.append(
+                    f'truncated CHAP frame {element_id!r}')
+                return
+            start_ms, end_ms = unpack_from('>II', content, offset)
+            subframe_data = content[offset + 16:]
+            title = None
+            for subframe_id, subframe_content in self._parse_subframes(
+                subframe_data, id3version
+            ):
+                if subframe_id in self._CHAPTER_TITLE_FRAME_IDS:
+                    title = self._decode_text_subframe(subframe_content)
+                    break
+            if start_ms == 0xFFFFFFFF:
+                self._chapter_warnings.append(
+                    f'CHAP frame {element_id!r} has no start time')
+                return
+            # 0xFFFFFFFF marks an unknown timestamp in the specification
+            end: int | None = (
+                None if end_ms == 0xFFFFFFFF else end_ms)
+            self._chap_frames.append(_ChapterFrame(
+                element_id, start_ms, end, title))
+            return
+        # CTOC
+        if offset + 2 > len(content):
+            self._chapter_warnings.append(
+                f'truncated CTOC frame {element_id!r}')
+            return
+        flags = content[offset]
+        entry_count = content[offset + 1]
+        offset += 2
+        child_ids: list[str] = []
+        for _i in range(entry_count):
+            child_id, offset = self._read_chapter_string(content, offset)
+            if child_id is None:
+                self._chapter_warnings.append(
+                    f'truncated CTOC frame {element_id!r}')
+                return
+            child_ids.append(child_id)
+        title = None
+        for subframe_id, subframe_content in self._parse_subframes(
+            content[offset:], id3version
+        ):
+            if subframe_id in self._CHAPTER_TITLE_FRAME_IDS:
+                title = self._decode_text_subframe(subframe_content)
+                break
+        self._ctoc_frames.append(_ChapterTOC(
+            element_id, bool(flags & 0x02), child_ids, title))
+
+    @staticmethod
+    def _read_chapter_string(
+        content: bytes, offset: int = 0
+    ) -> tuple[str | None, int]:
+        end_pos = content.find(b'\x00', offset)
+        if end_pos < 0:
+            return None, offset
+        value = content[offset:end_pos].decode('latin-1', 'replace')
+        return value, end_pos + 1
+
+    def _parse_subframes(self,
+                         content: bytes,
+                         id3version: int | None) -> Iterator[
+                             tuple[bytes, bytes]]:
+        # Chapter frames may embed regular ID3v2 frames (e.g. TIT2)
+        header_len = 6 if id3version == 2 else 10
+        offset = 0
+        content_length = len(content)
+        while offset + header_len <= content_length:
+            header = content[offset:offset + header_len]
+            subframe_id = header[:3] if id3version == 2 else header[:4]
+            if subframe_id in self._EMPTY_FRAME_IDS or not subframe_id.strip(
+                b'\x00'
+            ):
+                break
+            if id3version == 2:
+                subframe_size = int.from_bytes(header[3:6], 'big')
+            elif id3version == 4:
+                subframe_size = self._unsynchsafe(header, 4)
+            else:
+                subframe_size = unpack_from('>I', header, 4)[0]
+            offset += header_len
+            if subframe_size > content_length - offset:
+                break
+            yield subframe_id, content[offset:offset + subframe_size]
+            offset += subframe_size
+
+    def _decode_text_subframe(self, content: bytes) -> str | None:
+        if not content:
+            return None
+        encoding = content[0]
+        if encoding not in self._VALID_STRING_ENCODINGS:
+            return None
+        value = self._decode_string(content[1:], encoding)
+        return value or None
+
+    def _resolve_id3_chapters(self) -> None:
+        if not self._chap_frames:
+            return
+        chapters_by_id: dict[str, _ChapterFrame] = {}
+        for frame in self._chap_frames:
+            if frame.element_id in chapters_by_id:
+                self._chapter_warnings.append(
+                    f'duplicate chapter ID {frame.element_id!r}')
+                continue
+            chapters_by_id[frame.element_id] = frame
+        ordered_ids: list[str] = []
+        if self._ctoc_frames:
+            self._flatten_id3_toc(ordered_ids)
+        placed = set(ordered_ids)
+        for frame in self._chap_frames:
+            if frame.element_id not in placed:
+                placed.add(frame.element_id)
+                ordered_ids.append(frame.element_id)
+        result = Chapters()
+        for index, element_id in enumerate(ordered_ids):
+            chapter_frame = chapters_by_id.get(element_id)
+            if chapter_frame is None:
+                self._chapter_warnings.append(
+                    f'chapter {element_id!r} is missing')
+                continue
+            end_ms = chapter_frame.end_ms
+            result.append(Chapter(
+                title=chapter_frame.title or None,
+                start=chapter_frame.start_ms / 1000.0,
+                end=None if end_ms is None else end_ms / 1000.0,
+                index=index
+            ))
+        self._chapters = result
+
+    def _flatten_id3_toc(self, ordered_ids: list[str]) -> None:
+        toc_by_id: dict[str, _ChapterTOC] = {}
+        for frame in self._ctoc_frames:
+            if frame.element_id in toc_by_id:
+                self._chapter_warnings.append(
+                    f'duplicate CTOC ID {frame.element_id!r}')
+                continue
+            toc_by_id[frame.element_id] = frame
+        roots = [frame for frame in self._ctoc_frames if frame.top_level]
+        if not roots:
+            # No top-level table of contents was declared. Fall back to the
+            # first CTOC frame, which is what broken taggers often write.
+            roots = self._ctoc_frames[:1]
+            if roots:
+                self._chapter_warnings.append(
+                    'no top-level CTOC frame found')
+        expanded: set[str] = set()
+
+        def _walk(element_id: str, ancestors: frozenset[str]) -> None:
+            if element_id in ancestors:
+                self._chapter_warnings.append(
+                    f'circular CTOC reference {element_id!r}')
+                return
+            if element_id in expanded:
+                return
+            expanded.add(element_id)
+            for child in toc_by_id[element_id].children:
+                if child in toc_by_id:
+                    _walk(child, ancestors | {element_id})
+                    continue
+                if child in ordered_ids:
+                    self._chapter_warnings.append(
+                        f'duplicate CTOC entry {child!r}')
+                    continue
+                ordered_ids.append(child)
+
+        for root in roots:
+            _walk(root.element_id, frozenset())
+
     def _parse_frame(self,
                      fh: BinaryIO,
                      total_size: int,
@@ -1383,6 +2035,10 @@ class _ID3(TinyTag):
             content = fh.read(frame_size)
             lyrics = self._parse_synced_lyrics(content)
             self._set_other_field('lyrics', lyrics)
+        elif self._parse_tags and frame_id in self._CHAPTER_FRAME_IDS:
+            content = fh.read(frame_size)
+            self._parse_chapter_frame(
+                frame_id, content, id3version=id3version)
         elif self._parse_tags and frame_id in self._CUSTOM_FRAME_IDS:
             # custom fields
             content = fh.read(frame_size)
@@ -1661,6 +2317,8 @@ class _MPEG(TinyTag):
 class _Ogg(TinyTag):
     """OGG Parser."""
 
+    _CHAPTER_KEY_PATTERN = re_compile(
+        r'chapter(\d+)(name)?$')
     _VORBIS_MAPPING = {
         'album': 'album',
         'albumartist': 'albumartist',
@@ -1833,13 +2491,15 @@ class _Ogg(TinyTag):
         fh: BinaryIO,
         load_image: bool = False,
         read_data: bool = True
-    ) -> Iterator[tuple[str, str | int | Image]]:
+    ) -> Iterator[tuple[str, str | int | Image | Chapters]]:
         # for the spec, see: http://xiph.org/vorbis/doc/v-comment.html
         # discnumber tag based on: https://en.wikipedia.org/wiki/Vorbis_comment
         # https://sno.phy.queensu.ca/~phil/exiftool/TagNames/Vorbis.html
         vendor_length = unpack('<I', fh.read(4))[0]
         fh.seek(vendor_length, SEEK_CUR)  # jump over vendor
         elements = unpack('<I', fh.read(4))[0]
+        chapter_entries: dict[int, str] = {}
+        chapter_names: dict[int, str] = {}
         for _i in range(elements):
             length = unpack('<I', fh.read(4))[0]
             if not read_data:
@@ -1858,6 +2518,15 @@ class _Ogg(TinyTag):
                         if result is not None:
                             fieldname, fieldvalue = result
                             yield fieldname, fieldvalue
+                elif _Ogg._CHAPTER_KEY_PATTERN.match(key_lower):
+                    match = _Ogg._CHAPTER_KEY_PATTERN.match(key_lower)
+                    assert match is not None
+                    index = int(match.group(1))
+                    suffix = match.group(2)
+                    if suffix == 'name':
+                        chapter_names[index] = value
+                    else:
+                        chapter_entries[index] = value
                 else:
                     if _DEBUG:
                         print('Found Vorbis Comment', key, value[:64])
@@ -1874,6 +2543,61 @@ class _Ogg(TinyTag):
                             yield fieldname, int(value)
                     else:
                         yield fieldname, value
+        chapters, warnings = cls._build_vorbis_chapters(
+            chapter_entries, chapter_names)
+        for warning in warnings:
+            yield 'chapter_warning', warning
+        if chapters:
+            yield 'chapters', chapters
+
+    @classmethod
+    def _build_vorbis_chapters(
+        cls,
+        chapter_entries: dict[int, str],
+        chapter_names: dict[int, str],
+    ) -> tuple[Chapters, list[str]]:
+        chapters = Chapters()
+        warnings: list[str] = []
+        last_start = -1.0
+        for index in sorted(chapter_entries):
+            timestamp = cls._parse_vorbis_timestamp(chapter_entries[index])
+            if timestamp is None:
+                warnings.append(
+                    f'invalid chapter timestamp {chapter_entries[index]!r}')
+                continue
+            if timestamp < last_start:
+                warnings.append(f'chapter {index} is out of order')
+            last_start = timestamp
+            title = chapter_names.get(index)
+            chapters.append(Chapter(
+                title=title or None,
+                start=timestamp,
+                end=None,
+                index=len(chapters)
+            ))
+        for index in chapter_names:
+            if index not in chapter_entries:
+                warnings.append(
+                    f'chapter {index} has a name but no timestamp')
+        return chapters, warnings
+
+    @staticmethod
+    def _parse_vorbis_timestamp(value: str) -> float | None:
+        value = value.strip()
+        if not value:
+            return None
+        try:
+            parts = value.split(':')
+            if len(parts) == 3:
+                hours, minutes, seconds = parts
+                return (int(hours) * 3600 + int(minutes) * 60
+                        + float(seconds))
+            if len(parts) == 2:
+                minutes, seconds = parts
+                return int(minutes) * 60 + float(seconds)
+            return float(value)
+        except ValueError:
+            return None
 
     def _set_vorbis_comment_fields(self, fh: BinaryIO) -> None:
         for fieldname, value in self._parse_vorbis_comment(
@@ -1882,6 +2606,12 @@ class _Ogg(TinyTag):
             if isinstance(value, Image):
                 # pylint: disable=protected-access
                 self.images._set_field(fieldname, value)
+                continue
+            if isinstance(value, Chapters):
+                self._set_chapters(value)
+                continue
+            if fieldname == 'chapter_warning':
+                self._chapter_warnings.append(str(value))
                 continue
             self._set_field(fieldname, value)
 
@@ -2139,9 +2869,17 @@ class _Flac(TinyTag):
                 # to find the actual size.
                 # pylint: disable=protected-access
                 for fieldname, value in _Ogg._parse_vorbis_comment(
-                    fh, read_data=self._parse_tags
+                    fh, load_image=self._load_image,
+                    read_data=self._parse_tags
                 ):
-                    if not isinstance(value, Image):
+                    if isinstance(value, Chapters):
+                        self._set_chapters(value)
+                    elif isinstance(value, Image):
+                        # pylint: disable=protected-access
+                        self.images._set_field(fieldname, value)
+                    elif fieldname == 'chapter_warning':
+                        self._chapter_warnings.append(str(value))
+                    else:
                         self._set_field(fieldname, value)
             elif block_type == self._PICTURE:
                 # Some files in the wild contain incorrect block sizes for

@@ -21,7 +21,8 @@ TINYTAG_ATTRIBUTES = {
     'album', 'albumartist', 'artist', 'bitdepth', 'bitrate',
     'channels', 'comment', 'composer', 'disc', 'disc_total', 'duration',
     'filesize', 'filename', 'genre', 'is_lossless', 'mime_type', 'samplerate',
-    'title', 'track', 'track_total', 'year'
+    'title', 'track', 'track_total', 'year',
+    'chapters', 'chapter_warnings'
 }
 
 
@@ -111,6 +112,15 @@ class TestCLI(TestCase):
     def test_meta_data_output_format_invalid(self) -> None:
         output = self.run_cli('-f invalid ' + MP3_WITH_IMG)
         self.assertFalse(output)
+
+    def test_chapter_output(self) -> None:
+        output = self.run_cli(
+            os.path.join(SAMPLE_FOLDER, 'chapters_id3v24.mp3'))
+        data = json.loads(output)
+        self.assertEqual(len(data['chapters']), 3)
+        self.assertEqual(data['chapters'][0], {
+            'title': 'Chapter One', 'start': 0.0, 'end': 1.2, 'index': 0})
+        self.assertNotIn('chapter_warnings', data)
 
     def test_fail_on_unsupported_file(self) -> None:
         with self.assertRaises(CalledProcessError):
