@@ -77,7 +77,7 @@ class TinyTag:
     SUPPORTED_FILE_EXTENSIONS = (
         '.mp1', '.mp2', '.mp3',
         '.oga', '.ogv', '.ogg', '.opus', '.spx',
-        '.wav', '.flac',
+        '.wav', '.flac', '.wv',
         '.wma', '.wmv', '.asf',
         '.m4b', '.m4a', '.m4r', '.m4v', '.mp4', '.aax', '.aaxc',
         '.aiff', '.aifc', '.aif', '.afc'
@@ -217,6 +217,7 @@ class TinyTag:
                 ('.mp1', '.mp2', '.mp3', '.flac'): _ID3,
                 ('.oga', '.ogv', '.ogg', '.opus', '.spx'): _Ogg,
                 ('.wav',): _Wave,
+                ('.wv',): _WavPack,
                 ('.wma', '.wmv', '.asf'): _ASF,
                 ('.m4b', '.m4a', '.m4r', '.m4v', '.mp4',
                  '.aax', '.aaxc'): _MP4,
@@ -257,6 +258,8 @@ class TinyTag:
             return _Ogg
         if header.startswith(b'RIFF') and header.startswith(b'WAVE', 8):
             return _Wave
+        if header.startswith(b'wvpk'):
+            return _WavPack
         if header.startswith(
             b'\x30\x26\xB2\x75\x8E\x66\xCF\x11\xA6\xD9\x00\xAA\x00\x62\xCE\x6C'
         ) and header.startswith(b'\x02', 29):
@@ -2080,6 +2083,221 @@ class _Wave(TinyTag):
             self.bitrate = block_align * self.samplerate * 8 / 1000
         self._duration_parsed = self._parse_duration
         self._tags_parsed = self._parse_tags
+
+
+class _WavPack(TinyTag):
+    """WavPack Parser.
+
+    https://www.wavpack.com/WavPack5FileFormat.pdf
+    """
+
+    _ID = b'wvpk'
+    _HEADER_SIZE = 32
+    # ckSize is the block size excluding the ckID and ckSize fields.
+    _MIN_BLOCK_SIZE = _HEADER_SIZE - 8
+    _UNKNOWN_TOTAL_SAMPLES = 0xFFFFFFFF
+    _SAMPLE_RATES = (
+        6000, 8000, 9600, 11025, 12000, 16000, 22050, 24000, 32000,
+        44100, 48000, 64000, 88200, 96000, 192000,
+    )
+    _APE_ID = b'APETAGEX'
+    _APE_HEADER_SIZE = 32
+    _ID3V1_TAG_SIZE = 128
+    _APE_MAPPING = {
+        # https://wiki.hydrogenaudio.org/index.php?title=APE_key
+        'title': 'title',
+        'artist': 'artist',
+        'album': 'album',
+        'albumartist': 'albumartist',
+        'album artist': 'albumartist',
+        'composer': 'composer',
+        'comment': 'comment',
+        'description': 'comment',
+        'genre': 'genre',
+        'year': 'year',
+        'date': 'year',
+        'track': 'track',
+        'tracknumber': 'track',
+        'tracktotal': 'track_total',
+        'totaltracks': 'track_total',
+        'disc': 'disc',
+        'discnumber': 'disc',
+        'disctotal': 'disc_total',
+        'totaldiscs': 'disc_total',
+        'bpm': 'other.bpm',
+        'copyright': 'other.copyright',
+        'isrc': 'other.isrc',
+        'lyrics': 'other.lyrics',
+        'unsyncedlyrics': 'other.lyrics',
+        'publisher': 'other.publisher',
+        'label': 'other.publisher',
+        'language': 'other.language',
+        'director': 'other.director',
+        'website': 'other.url',
+        'url': 'other.url',
+        'conductor': 'other.conductor',
+        'lyricist': 'other.lyricist',
+        'discsubtitle': 'other.set_subtitle',
+        'setsubtitle': 'other.set_subtitle',
+        'initialkey': 'other.initial_key',
+        'encodedby': 'other.encoded_by',
+        'encodersettings': 'other.encoder_settings',
+        'media': 'other.media',
+        'barcode': 'other.barcode',
+        'catalognumber': 'other.catalog_number',
+        'movementname': 'other.movement_name',
+        'movement': 'other.movement',
+        'movementtotal': 'other.movement_total',
+        'grouping': 'other.grouping',
+        'work': 'other.work',
+    }
+
+    def _parse(self, fh: BinaryIO) -> None:
+        if not self.filesize:
+            fh.seek(0, SEEK_END)
+            self.filesize = fh.tell()
+            fh.seek(0)
+        self.mime_type = 'audio/x-wavpack'
+        if self._parse_duration:
+            self._parse_audio(fh)
+        if self._parse_tags:
+            self._parse_ape_tag(fh)
+        self._duration_parsed = self._parse_duration
+        self._tags_parsed = self._parse_tags
+
+    def _parse_audio(self, fh: BinaryIO) -> None:
+        audio_total_samples = 0
+        audio_block_index = 0
+        audio_flags = 0
+        found_audio_block = False
+        summed_samples = 0
+        audio_bytes = 0
+        while True:
+            block_start = fh.tell()
+            header = fh.read(self._HEADER_SIZE)
+            if not header:
+                break
+            if len(header) != self._HEADER_SIZE:
+                if block_start == 0 or header.startswith(self._ID):
+                    raise ParseError('Truncated WavPack block header')
+                # Trailing non-block data, e.g. a partial tag
+                break
+            if not header.startswith(self._ID):
+                if block_start == 0:
+                    raise ParseError('Invalid WavPack header')
+                # Reached an APEv2/ID3 tag or padding between/after blocks
+                break
+            block_size = unpack_from('<I', header, 4)[0]
+            total_samples = unpack_from('<I', header, 12)[0]
+            block_index = unpack_from('<I', header, 16)[0]
+            block_samples = unpack_from('<I', header, 20)[0]
+            flags = unpack_from('<I', header, 24)[0]
+            if block_size < self._MIN_BLOCK_SIZE:
+                raise ParseError('Invalid WavPack block size')
+            block_end = block_start + 8 + block_size
+            if block_end > self.filesize:
+                raise ParseError('Truncated WavPack block')
+            summed_samples += block_samples
+            audio_bytes += block_end - block_start
+            # Metadata-only blocks have block_samples == 0. The first block
+            # containing audio determines the audio parameters of the file.
+            if not found_audio_block and block_samples > 0:
+                found_audio_block = True
+                audio_total_samples = total_samples
+                audio_block_index = block_index
+                audio_flags = flags
+            fh.seek(block_end)
+        if not found_audio_block:
+            raise ParseError('No audio in WavPack file')
+        rate_index = (audio_flags >> 23) & 0xF
+        if rate_index >= len(self._SAMPLE_RATES):
+            # 15 means unknown/custom sample rate
+            raise ParseError('Invalid WavPack sample rate')
+        samplerate = self._SAMPLE_RATES[rate_index]
+        channels = 1 if audio_flags & 0x04 else 2
+        bitdepth = ((audio_flags & 0x03) + 1) * 8
+        is_dsd = bool(audio_flags & 0x80000000)
+        if is_dsd:
+            # DSD rates are a multiple of the indexed PCM rate
+            samplerate *= 4
+            bitdepth = 1
+        if samplerate <= 0 or channels <= 0 or bitdepth <= 0:
+            raise ParseError('Invalid WavPack audio parameters')
+        self.samplerate = samplerate
+        self.channels = channels
+        self.bitdepth = bitdepth
+        # Bit 3 set means hybrid (lossy main stream + correction file)
+        self.is_lossless = not bool(audio_flags & 0x08)
+        if (audio_total_samples != self._UNKNOWN_TOTAL_SAMPLES
+                and audio_block_index == 0):
+            samples = audio_total_samples
+        else:
+            # Unknown length or cut/streamed file: sum up block samples
+            samples = summed_samples
+        if samples > 0:
+            self.duration = samples / samplerate
+            self.bitrate = audio_bytes * 8 / self.duration / 1000
+
+    def _parse_ape_tag(self, fh: BinaryIO) -> None:
+        # APEv2 footer is the final 32 bytes, unless an ID3v1 tag follows
+        footer_pos = self.filesize - self._APE_HEADER_SIZE
+        if self.filesize >= self._ID3V1_TAG_SIZE + self._APE_HEADER_SIZE:
+            fh.seek(-self._ID3V1_TAG_SIZE, SEEK_END)
+            if fh.read(3) == b'TAG':
+                footer_pos -= self._ID3V1_TAG_SIZE
+        if footer_pos < 0:
+            return
+        fh.seek(footer_pos)
+        footer = fh.read(self._APE_HEADER_SIZE)
+        if (len(footer) != self._APE_HEADER_SIZE
+                or not footer.startswith(self._APE_ID)):
+            return
+        tag_size = unpack_from('<I', footer, 12)[0]
+        item_count = unpack_from('<I', footer, 16)[0]
+        if tag_size < self._APE_HEADER_SIZE:
+            return
+        items_end = footer_pos
+        items_start = footer_pos - (tag_size - self._APE_HEADER_SIZE)
+        if items_start < 0 or items_start > items_end:
+            return
+        fh.seek(items_start)
+        data = fh.read(items_end - items_start)
+        pos = 0
+        for _ in range(item_count):
+            if pos + 8 > len(data):
+                break
+            value_size, item_flags = unpack_from('<II', data, pos)
+            pos += 8
+            key_end = data.find(b'\x00', pos)
+            if key_end == -1:
+                break
+            key = data[pos:key_end]
+            pos = key_end + 1
+            if value_size > len(data) - pos:
+                break
+            value_data = data[pos:pos + value_size]
+            pos += value_size
+            key_name = key.decode('utf-8', 'replace').lower()
+            fieldname = self._APE_MAPPING.get(
+                key_name, self._OTHER_PREFIX + key_name)
+            value_kind = (item_flags >> 1) & 0x3
+            if value_kind == 1:
+                continue  # binary data, e.g. cover art
+            for raw_value in value_data.split(b'\x00'):
+                value = raw_value.decode('utf-8', 'replace')
+                if fieldname in {
+                    'track', 'disc', 'track_total', 'disc_total'
+                }:
+                    if fieldname in {'track', 'disc'} and '/' in value:
+                        main_value, total = value.split('/', 1)
+                        if total.isdecimal():
+                            self._set_field(
+                                f'{fieldname}_total', int(total))
+                        value = main_value
+                    if value.isdecimal():
+                        self._set_field(fieldname, int(value))
+                else:
+                    self._set_field(fieldname, value)
 
 
 class _Flac(TinyTag):

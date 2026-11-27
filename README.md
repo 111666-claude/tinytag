@@ -32,6 +32,7 @@ python3 -m pip install tinytag
     * WAVE / WAV
     * OGG (FLAC / Opus / Speex / Vorbis)
     * FLAC
+    * WavPack
     * ASF (WMA)
     * AIFF / AIFF-C
   * Same API for all formats
@@ -185,6 +186,9 @@ value provided by the format is used.
 
     # FLAC
     audio/flac
+
+    # WavPack
+    audio/x-wavpack
 
     # MP4
     audio/mp4
