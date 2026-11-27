@@ -23,7 +23,10 @@ keywords = [
     "opus",
     "flac",
     "wma",
-    "aiff"
+    "aiff",
+    "mpc",
+    "musepack",
+    "apev2"
 ]
 classifiers = [
     "Programming Language :: Python",

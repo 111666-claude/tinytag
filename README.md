@@ -34,6 +34,7 @@ python3 -m pip install tinytag
     * FLAC
     * ASF (WMA)
     * AIFF / AIFF-C
+    * Musepack SV7 (APEv2 tags)
   * Same API for all formats
   * Small, portable library
   * High code coverage
@@ -487,6 +488,10 @@ UnsupportedFormatError  # File format is not supported
 
 
 ## Changelog
+
+### Unreleased
+
+- Add support for Musepack SV7 (.mpc) audio properties and APEv2 tags
 
 ### 2.3.2  (2026-09-07)
 

@@ -80,7 +80,8 @@ class TinyTag:
         '.wav', '.flac',
         '.wma', '.wmv', '.asf',
         '.m4b', '.m4a', '.m4r', '.m4v', '.mp4', '.aax', '.aaxc',
-        '.aiff', '.aifc', '.aif', '.afc'
+        '.aiff', '.aifc', '.aif', '.afc',
+        '.mpc', '.mp+'
     )
     _OTHER_PREFIX = 'other.'
     _file_extension_mapping: dict[tuple[str, ...], type[TinyTag]] | None = None
@@ -221,6 +222,7 @@ class TinyTag:
                 ('.m4b', '.m4a', '.m4r', '.m4v', '.mp4',
                  '.aax', '.aaxc'): _MP4,
                 ('.aiff', '.aifc', '.aif', '.afc'): _Aiff,
+                ('.mpc', '.mp+'): _Musepack,
             }
         filename = filename.lower()
         for ext, tagclass in cls._file_extension_mapping.items():
@@ -265,6 +267,9 @@ class TinyTag:
         if (header.startswith(b'FORM')
                 and header.startswith((b'AIFF', b'AIFC'), 8)):
             return _Aiff
+        if (len(header) >= 4 and header.startswith(b'MP+')
+                and header[3] in {0x07, 0x17}):
+            return _Musepack
         return None
 
     @classmethod
@@ -2528,3 +2533,213 @@ class _Aiff(TinyTag):
                 fh.seek(subchunk_size, SEEK_CUR)
             chunk_header = fh.read(header_len)
         self._tags_parsed = self._parse_tags
+
+
+class _Musepack(TinyTag):
+    """Musepack SV7 Parser.
+
+    https://files.musepack.net/sv7_spec.pdf (stream header)
+    https://wiki.hydrogenaud.io/index.php?title=APEv2_specification
+    """
+
+    _SV7_FRAME_SAMPLES = 1152
+    # Encoder/decoder synthetic delay, in samples
+    _SV7_DELAY_SAMPLES = 576
+    _SV7_HEADER_SIZE = 24
+    _SV7_SAMPLE_RATES = (44100, 48000, 37800, 32000)
+    _SV7_VERSIONS = (0x07, 0x17)
+
+    _APE_TAG_PREAMBLE = b'APETAGEX'
+    _APE_TAG_FOOTER_SIZE = 32
+    _APE_TAG_VERSION = 2000
+    _APE_FLAG_HAS_HEADER = 1 << 31
+    _APE_FLAG_IS_HEADER = 1 << 29
+    _APE_ITEM_TYPE_BINARY = 1
+    _APE_ITEM_TYPE_MASK = 0x03
+
+    _APE_MAPPING = {
+        'title': 'title',
+        'artist': 'artist',
+        'album': 'album',
+        'albumartist': 'albumartist',
+        'comment': 'comment',
+        'genre': 'genre',
+        'year': 'year',
+        'track': 'track',
+        'disc': 'disc',
+        'composer': 'composer',
+        'conductor': 'other.conductor',
+        'lyricist': 'other.lyricist',
+        'lyrics': 'other.lyrics',
+        'publisher': 'other.publisher',
+        'isrc': 'other.isrc',
+        'copyright': 'other.copyright',
+        'language': 'other.language',
+        'media': 'other.media',
+        'barcode': 'other.barcode',
+        'catalognumber': 'other.catalog_number',
+        'website': 'other.url',
+        'encoder': 'other.encoder',
+        'encodedby': 'other.encoded_by',
+        'encodersettings': 'other.encoder_settings',
+        'initialkey': 'other.initial_key',
+    }
+
+    def _parse(self, fh: BinaryIO) -> None:
+        header = fh.read(8)
+        if not header.startswith(b'MP+'):
+            raise ParseError('Invalid Musepack header')
+        stream_version = header[3]
+        if stream_version not in self._SV7_VERSIONS:
+            raise ParseError('Unsupported Musepack stream version')
+        # Stream header, little endian dwords:
+        # dword 0: magic 'MP+' and stream version
+        # dword 1: number of frames
+        # dword 2: profile/max band/sample rate/peak title
+        # dword 3/4: replay gain/peak data
+        # dword 5: gapless/seek table/encoder information
+        data = fh.read(16)
+        if len(data) != 16:
+            raise ParseError('Truncated Musepack stream header')
+        header_data = unpack('<IIII', data)
+        frame_count = unpack('<I', header[4:8])[0]
+        sample_rate = self._SV7_SAMPLE_RATES[
+            (header_data[0] >> 16) & 0x03
+        ]
+        self.mime_type = 'audio/musepack'
+        if self._parse_duration:
+            self.is_lossless = False
+            self.channels = 2
+            self.samplerate = sample_rate
+        if frame_count > 0 and self._parse_duration:
+            # Estimate, as done by libmpcdec
+            pcm_samples = (
+                frame_count * self._SV7_FRAME_SAMPLES
+                - self._SV7_DELAY_SAMPLES
+            )
+            if pcm_samples > 0:
+                self.duration = pcm_samples / sample_rate
+        # Locate the trailing tag even when tags are not requested, so the
+        # tag size is not counted as audio data
+        tag_start = self._locate_ape_tag(fh)
+        if self.duration:
+            audio_size = tag_start - self._SV7_HEADER_SIZE
+            if audio_size > 0:
+                self.bitrate = (
+                    audio_size * 8 / self.duration / 1000
+                )
+        self._duration_parsed = self._parse_duration
+        self._tags_parsed = self._parse_tags
+
+    def _locate_ape_tag(self, fh: BinaryIO) -> int:
+        """Return the start offset of the APEv2 tag at the file end.
+
+        If there is no usable tag, the file size is returned instead.
+        When tag parsing is enabled, the tag items are parsed as well.
+        """
+        if self.filesize < self._APE_TAG_FOOTER_SIZE:
+            return self.filesize
+        fh.seek(-self._APE_TAG_FOOTER_SIZE, SEEK_END)
+        footer = fh.read(self._APE_TAG_FOOTER_SIZE)
+        if not footer.startswith(self._APE_TAG_PREAMBLE):
+            return self.filesize
+        version, tag_size, item_count, flags = unpack('<IIII', footer[8:24])
+        if version != self._APE_TAG_VERSION:
+            # APEv1 and any unknown versions use a different layout,
+            # leave the audio properties available without tag data
+            return self.filesize
+        if flags & self._APE_FLAG_IS_HEADER:
+            raise ParseError('Invalid APE tag footer')
+        if tag_size < self._APE_TAG_FOOTER_SIZE:
+            raise ParseError('Invalid APE tag size')
+        audio_end: int = self.filesize - tag_size
+        if flags & self._APE_FLAG_HAS_HEADER:
+            audio_end -= self._APE_TAG_FOOTER_SIZE
+        if audio_end < self._SV7_HEADER_SIZE:
+            raise ParseError('APE tag extends beyond file')
+        if item_count > 65536:
+            raise ParseError('Too many APE tag items')
+        if not self._parse_tags:
+            return audio_end
+        item_start = audio_end + (
+            self._APE_TAG_FOOTER_SIZE
+            if flags & self._APE_FLAG_HAS_HEADER else 0
+        )
+        fh.seek(item_start)
+        item_data_end = self.filesize - self._APE_TAG_FOOTER_SIZE
+        for _index in range(item_count):
+            self._parse_ape_item(fh, item_data_end)
+        return audio_end
+
+    def _parse_ape_item(
+        self,
+        fh: BinaryIO,
+        item_data_end: int
+    ) -> None:
+        item_header = self._read_exact(fh, 8)
+        value_size, item_flags = unpack('<II', item_header)
+        # Item layout after the header: key, NUL byte, value
+        key = self._read_ape_key(fh)
+        if fh.tell() + value_size > item_data_end:
+            raise ParseError('Truncated APE tag item')
+        # Item types: 0 = UTF-8 text, 1 = binary, 2 = locator (URI text),
+        # 3 = reserved. Binary data is skipped, the rest is read as text.
+        if (item_flags & self._APE_ITEM_TYPE_MASK
+                == self._APE_ITEM_TYPE_BINARY):
+            fh.seek(value_size, SEEK_CUR)
+            return
+        value_bytes = self._read_exact(fh, value_size)
+        key_lower = key.lower()
+        fieldname = self._APE_MAPPING.get(
+            key_lower, self._OTHER_PREFIX + key_lower
+        )
+        is_other_field = fieldname.startswith(self._OTHER_PREFIX)
+        if is_other_field:
+            fieldname = fieldname[len(self._OTHER_PREFIX):]
+        for value in value_bytes.split(b'\x00'):
+            text = self._unpad(value.decode('utf-8', 'replace'))
+            if not text:
+                continue
+            if is_other_field:
+                self._set_other_field(fieldname, text)
+            elif fieldname in {'track', 'disc'}:
+                # APE track/disc values may use a 'number/total' notation
+                number = text
+                if '/' in number:
+                    number, total = number.split('/', 1)
+                    if total.isdecimal():
+                        self._set_field(
+                            f'{fieldname}_total', int(total)
+                        )
+                if number.isdecimal():
+                    self._set_field(fieldname, int(number))
+            else:
+                # Additional values of standard fields go to 'other',
+                # matching the behavior of the other parsers
+                self._set_field(fieldname, text)
+
+    @staticmethod
+    def _read_ape_key(fh: BinaryIO) -> str:
+        # APEv2 keys are at most 255 bytes, including the NUL terminator
+        key_bytes = bytearray()
+        while len(key_bytes) < 255:
+            char = fh.read(1)
+            if not char:
+                raise ParseError('Truncated APE tag key')
+            if char == b'\x00':
+                break
+            if not 0x20 <= char[0] <= 0x7E:
+                raise ParseError('Invalid APE tag key')
+            key_bytes += char
+        else:
+            raise ParseError('APEv2 key is too long')
+        if not key_bytes:
+            raise ParseError('Empty APE tag key')
+        return key_bytes.decode('ascii')
+
+    @staticmethod
+    def _read_exact(fh: BinaryIO, size: int) -> bytes:
+        data = fh.read(size)
+        if len(data) != size:
+            raise ParseError('Truncated APE tag')
+        return data

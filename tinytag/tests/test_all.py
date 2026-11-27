@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os.path
+import struct
 
 from io import BytesIO, TextIOWrapper
 from pathlib import Path
@@ -17,7 +18,9 @@ from unittest import skipIf, TestCase
 
 from tinytag import ParseError, TinyTagException, UnsupportedFormatError
 from tinytag import Image, Images, OtherFields, OtherImages, TinyTag
-from tinytag.tinytag import _ID3, _MPEG, _Ogg, _Wave, _Flac, _ASF, _MP4, _Aiff
+from tinytag.tinytag import (
+    _ID3, _MPEG, _Ogg, _Wave, _Flac, _ASF, _MP4, _Aiff, _Musepack
+)
 
 TYPE_CHECKING = False
 
@@ -3032,6 +3035,34 @@ TEST_FILES: dict[str, ExpectedTag] = dict([
         'mime_type': 'audio/aiff',
         'filesize': 12,
     }),
+    ('sv7_sample.mpc', {
+        'other': OtherFields(),
+        'mime_type': 'audio/musepack',
+        'is_lossless': False,
+        'channels': 2,
+        'samplerate': 44100,
+        'duration': 2880 / 44100,
+        'filesize': 1588,
+        'bitrate': 191.58999999999997,
+    }),
+    ('sv7_with_ape.mpc', {
+        'other': OtherFields({
+            'genre': ['Rock'],
+            'custom field': ['custom value'],
+            'url': ['https://example.invalid/music'],
+        }),
+        'mime_type': 'audio/musepack',
+        'is_lossless': False,
+        'channels': 2,
+        'samplerate': 44100,
+        'duration': 2880 / 44100,
+        'filesize': 1863,
+        'bitrate': 191.58999999999997,
+        'title': 'Click Test',
+        'artist': 'Test Artist',
+        'track': 3,
+        'genre': 'Pop',
+    }),
 ])
 
 IMAGE_TEST_FILES: dict[str, ExpectedImages] = dict([
@@ -3440,11 +3471,205 @@ class TestAll(TestCase):
             ('invalid_file.wav', _Wave),
             ('invalid_file.asf', _ASF),
             ('invalid_file.aiff', _Aiff),
+            ('invalid_file.mpc', _Musepack),
         ):
             with self.subTest(path=path, cls=cls):
                 with self.assertRaises(ParseError) as context:
                     cls.get(os.path.join(SAMPLE_FOLDER, path))
                 self.assertIsInstance(context.exception, TinyTagException)
+
+    def test_musepack_sv7(self) -> None:
+        # Public short SV7 sample: 3 frames, 44.1 kHz, stereo
+        tag = TinyTag.get(os.path.join(SAMPLE_FOLDER, 'sv7_sample.mpc'))
+        self.assertEqual(tag.samplerate, 44100)
+        self.assertEqual(tag.channels, 2)
+        self.assertEqual(tag.duration, 2880 / 44100)
+        self.assertIsInstance(tag, _Musepack)
+        # A tagless file still exposes the audio properties
+        self.assertIsNone(tag.title)
+        self.assertEqual(tag.other, OtherFields())
+        # Fixed sample with an APEv2 tag
+        tagged = TinyTag.get(
+            os.path.join(SAMPLE_FOLDER, 'sv7_with_ape.mpc')
+        )
+        self.assertEqual(tagged.samplerate, 44100)
+        self.assertEqual(tagged.channels, 2)
+        self.assertEqual(tagged.duration, 2880 / 44100)
+        self.assertEqual(tagged.title, 'Click Test')
+        self.assertEqual(tagged.artist, 'Test Artist')
+        self.assertEqual(tagged.track, 3)
+        # Multi-value text: first value on the standard field, the rest
+        # under 'other'; unknown keys follow the 'other' semantics
+        self.assertEqual(tagged.genre, 'Pop')
+        self.assertEqual(tagged.other['genre'], ['Rock'])
+        self.assertEqual(
+            tagged.other['custom field'], ['custom value']
+        )
+        # Binary items are skipped, locator items are read as text
+        self.assertEqual(
+            tagged.other['url'], ['https://example.invalid/music']
+        )
+        # The tag bytes do not count into duration or bitrate
+        self.assertEqual(tagged.bitrate, tag.bitrate)
+        self.assertEqual(tagged.duration, tag.duration)
+
+    def test_musepack_sv7_malformed(self) -> None:
+        with open(
+            os.path.join(SAMPLE_FOLDER, 'sv7_sample.mpc'), 'rb'
+        ) as file_handle:
+            audio = file_handle.read()
+        # Unsupported stream version and truncated headers (direct parser,
+        # magic byte detection rejects unknown versions beforehand)
+        for data in (
+            b'XXXX' + audio[4:],
+            b'MP+\x08' + audio[4:],
+            audio[:4],
+            audio[:20],
+        ):
+            with self.subTest(data=data):
+                with self.assertRaises(ParseError):
+                    _Musepack.get(file_obj=BytesIO(data))
+        # An APE footer with an impossible tag size
+        footer = (
+            b'APETAGEX' + struct.pack('<IIII', 2000, 999999, 0, 0)
+            + b'\x00' * 8
+        )
+        with self.assertRaises(ParseError):
+            TinyTag.get(file_obj=BytesIO(audio + footer))
+        # A tag size smaller than the mandatory 32 byte footer
+        footer = (
+            b'APETAGEX' + struct.pack('<IIII', 2000, 16, 0, 0)
+            + b'\x00' * 8
+        )
+        with self.assertRaises(ParseError):
+            TinyTag.get(file_obj=BytesIO(audio + footer))
+        # A footer that is actually flagged as a header
+        footer = (
+            b'APETAGEX' + struct.pack('<IIII', 2000, 32, 0, 1 << 29)
+            + b'\x00' * 8
+        )
+        with self.assertRaises(ParseError):
+            TinyTag.get(file_obj=BytesIO(audio + footer))
+        # A footer announcing more than the permitted number of items
+        footer = (
+            b'APETAGEX' + struct.pack('<IIII', 2000, 32, 70000, 0)
+            + b'\x00' * 8
+        )
+        with self.assertRaises(ParseError):
+            TinyTag.get(file_obj=BytesIO(audio + footer))
+        # A truncated APE item: one item announced, no item data present
+        footer = (
+            b'APETAGEX' + struct.pack('<IIII', 2000, 64, 1, 0)
+            + b'\x00' * 8
+        )
+        with self.assertRaises(ParseError):
+            TinyTag.get(file_obj=BytesIO(audio + footer))
+        # An item whose declared value runs past the physical file end
+        item = struct.pack('<II', 256, 0) + b'Ab\x00' + b'abcd'
+        footer = (
+            b'APETAGEX'
+            + struct.pack('<IIII', 2000, len(item) + 32, 1, 0)
+            + b'\x00' * 8
+        )
+        with self.assertRaises(ParseError):
+            TinyTag.get(file_obj=BytesIO(audio + item + footer))
+        # An item with a non-printable byte in its key
+        item = struct.pack('<II', 3, 0) + b'A\x01B\x00' + b'abc'
+        footer = (
+            b'APETAGEX'
+            + struct.pack('<IIII', 2000, len(item) + 32, 1, 0)
+            + b'\x00' * 8
+        )
+        with self.assertRaises(ParseError):
+            TinyTag.get(file_obj=BytesIO(audio + item + footer))
+        # An item with a key longer than the 255 byte APEv2 limit
+        long_key = b'A' * 256 + b'\x00'
+        item = struct.pack('<II', 1, 0) + long_key + b'x'
+        footer = (
+            b'APETAGEX'
+            + struct.pack('<IIII', 2000, len(item) + 32, 1, 0)
+            + b'\x00' * 8
+        )
+        with self.assertRaises(ParseError):
+            TinyTag.get(file_obj=BytesIO(audio + item + footer))
+        # An item with an empty key
+        item = struct.pack('<II', 1, 0) + b'\x00' + b'x'
+        footer = (
+            b'APETAGEX'
+            + struct.pack('<IIII', 2000, len(item) + 32, 1, 0)
+            + b'\x00' * 8
+        )
+        with self.assertRaises(ParseError):
+            TinyTag.get(file_obj=BytesIO(audio + item + footer))
+        # An item whose key reaches the physical file end without a NUL
+        item = struct.pack('<II', 1, 0) + b'Abc'
+        footer = (
+            b'APETAGEX'
+            + struct.pack('<IIII', 2000, len(item) + 32, 1, 0)
+            + b'\x00' * 8
+        )
+        with self.assertRaises(ParseError):
+            TinyTag.get(file_obj=BytesIO(audio + item + footer))
+        # A key reader that hits the physical end before the NUL byte
+        # pylint: disable=protected-access
+        with self.assertRaises(ParseError):
+            _Musepack()._read_ape_key(BytesIO(b'Abc'))
+        # A fixed-size read that cannot return the requested number of
+        # bytes, e.g. when the file ends inside an item header or value
+        with self.assertRaises(ParseError):
+            _Musepack()._read_exact(BytesIO(b'abcd'), 8)
+        # pylint: enable=protected-access
+        # Track numbers using the 'number/total' notation
+        item = struct.pack('<II', 3, 0) + b'Track\x00' + b'5/9'
+        footer = (
+            b'APETAGEX'
+            + struct.pack('<IIII', 2000, len(item) + 32, 1, 0)
+            + b'\x00' * 8
+        )
+        tag = TinyTag.get(file_obj=BytesIO(audio + item + footer))
+        self.assertEqual(tag.track, 5)
+        self.assertEqual(tag.track_total, 9)
+        # A non-numeric total is ignored but the number itself is still read
+        item = struct.pack('<II', 5, 0) + b'Track\x00' + b'7/none'
+        footer = (
+            b'APETAGEX'
+            + struct.pack('<IIII', 2000, len(item) + 32, 1, 0)
+            + b'\x00' * 8
+        )
+        tag = TinyTag.get(file_obj=BytesIO(audio + item + footer))
+        self.assertEqual(tag.track, 7)
+        self.assertIsNone(tag.track_total)
+        # Empty values are skipped rather than stored
+        item = struct.pack('<II', 2, 0) + b'Title\x00' + b'\x00\x00'
+        footer = (
+            b'APETAGEX'
+            + struct.pack('<IIII', 2000, len(item) + 32, 1, 0)
+            + b'\x00' * 8
+        )
+        tag = TinyTag.get(file_obj=BytesIO(audio + item + footer))
+        self.assertIsNone(tag.title)
+        self.assertEqual(tag.other, OtherFields())
+        # A partial preamble is not a tag: audio properties stay available
+        tag = TinyTag.get(file_obj=BytesIO(audio + b'APETAGEX'))
+        self.assertEqual(tag.duration, 2880 / 44100)
+        self.assertEqual(tag.samplerate, 44100)
+        # A three byte 'MP+' prefix is too short for the version byte and
+        # must be reported as unsupported instead of raising an index error
+        with self.assertRaises(UnsupportedFormatError):
+            TinyTag.get(file_obj=BytesIO(b'MP+'))
+        # A complete header in a file shorter than an APE footer still
+        # returns its audio properties without a tag
+        tag = TinyTag.get(file_obj=BytesIO(audio[:28]))
+        self.assertEqual(tag.samplerate, 44100)
+        self.assertEqual(tag.other, OtherFields())
+        # APEv1 uses a different layout and is ignored gracefully
+        footer_v1 = (
+            b'APETAGEX' + struct.pack('<IIII', 1000, 32, 0, 0)
+            + b'\x00' * 8
+        )
+        tag = TinyTag.get(file_obj=BytesIO(audio + footer_v1))
+        self.assertEqual(tag.duration, 2880 / 44100)
+        self.assertEqual(tag.other, OtherFields())
 
     def test_image_construction(self) -> None:
         name = 'front_cover'
@@ -3509,6 +3734,7 @@ class TestAll(TestCase):
             ('detect_asf.x', _ASF),
             ('detect_mp4_m4a.x', _MP4),
             ('detect_aiff.x', _Aiff),
+            ('detect_mpc_sv7.x', _Musepack),
         ):
             with self.subTest(testfile=testfile, expected=expected):
                 filename = os.path.join(SAMPLE_FOLDER, testfile)
