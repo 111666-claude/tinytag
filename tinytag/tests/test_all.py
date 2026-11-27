@@ -1446,6 +1446,70 @@ TEST_FILES: dict[str, ExpectedTag] = dict([
         'is_lossless': False,
         'filesize': 3979,
     }),
+    ('vorbis_1s.ogg', {
+        'other': OtherFields({
+            'encoder': ['Lavc62.11.100 libvorbis'],
+        }),
+        'mime_type': 'audio/ogg; codecs="vorbis"',
+        'is_lossless': False,
+        'filesize': 5362,
+        'duration': 1.0,
+        'channels': 1,
+        'bitrate': 86.0,
+        'samplerate': 44100,
+    }),
+    ('vorbis_2s.ogg', {
+        'other': OtherFields({
+            'encoder': ['Lavc62.11.100 libvorbis'],
+        }),
+        'mime_type': 'audio/ogg; codecs="vorbis"',
+        'is_lossless': False,
+        'filesize': 6898,
+        'duration': 2.0,
+        'channels': 1,
+        'bitrate': 86.0,
+        'samplerate': 44100,
+    }),
+    ('chained_vorbis.ogg', {
+        # vorbis_1s.ogg and vorbis_2s.ogg concatenated together
+        'other': OtherFields({
+            'encoder': ['Lavc62.11.100 libvorbis'],
+        }),
+        'mime_type': 'audio/ogg; codecs="vorbis"',
+        'is_lossless': False,
+        'filesize': 12260,
+        'duration': 3.0,
+        'channels': 1,
+        'bitrate': 86.0,
+        'samplerate': 44100,
+    }),
+    ('chained_vorbis_invalid_granule.ogg', {
+        # Granule positions of the second chain segment go backwards,
+        # so the full duration cannot be determined
+        'other': OtherFields({
+            'encoder': ['Lavc62.11.100 libvorbis'],
+        }),
+        'mime_type': 'audio/ogg; codecs="vorbis"',
+        'is_lossless': False,
+        'filesize': 12260,
+        'channels': 1,
+        'bitrate': 86.0,
+        'samplerate': 44100,
+    }),
+    ('multiplexed_vorbis.ogg', {
+        # Interleaved 1s and 2s vorbis streams. Durations of multiplexed
+        # streams must not be summed, the first audio stream wins.
+        'other': OtherFields({
+            'encoder': ['Lavc62.11.100 libvorbis'],
+        }),
+        'mime_type': 'audio/ogg; codecs="vorbis"',
+        'is_lossless': False,
+        'filesize': 12235,
+        'duration': 1.0,
+        'channels': 1,
+        'bitrate': 86.0,
+        'samplerate': 44100,
+    }),
     ('silence.opus', {
         'other': OtherFields(),
         'mime_type': 'audio/ogg; codecs="opus"',
@@ -1463,6 +1527,55 @@ TEST_FILES: dict[str, ExpectedTag] = dict([
         'filesize': 155,
         'duration': 0.1065,
         'bitrate': 1.3521126760563382,
+        'samplerate': 48000,
+    }),
+    ('opus_1s.opus', {
+        'other': OtherFields({
+            'encoder': ['Lavc62.11.100 libopus'],
+        }),
+        'mime_type': 'audio/ogg; codecs="opus"',
+        'is_lossless': False,
+        'filesize': 9519,
+        'duration': 1.0,
+        'channels': 1,
+        'bitrate': 74.208,
+        'samplerate': 48000,
+    }),
+    ('opus_2s.opus', {
+        'other': OtherFields({
+            'encoder': ['Lavc62.11.100 libopus'],
+        }),
+        'mime_type': 'audio/ogg; codecs="opus"',
+        'is_lossless': False,
+        'filesize': 18446,
+        'duration': 2.0,
+        'channels': 1,
+        'bitrate': 72.504,
+        'samplerate': 48000,
+    }),
+    ('chained_opus.opus', {
+        # opus_1s.opus and opus_2s.opus concatenated together
+        'other': OtherFields({
+            'encoder': ['Lavc62.11.100 libopus'],
+        }),
+        'mime_type': 'audio/ogg; codecs="opus"',
+        'is_lossless': False,
+        'filesize': 27965,
+        'duration': 3.0,
+        'channels': 1,
+        'bitrate': 73.072,
+        'samplerate': 48000,
+    }),
+    ('chained_opus_truncated.opus', {
+        # The second chain segment is missing its end page, so the full
+        # duration cannot be determined
+        'other': OtherFields({
+            'encoder': ['Lavc62.11.100 libopus'],
+        }),
+        'mime_type': 'audio/ogg; codecs="opus"',
+        'is_lossless': False,
+        'filesize': 27765,
+        'channels': 1,
         'samplerate': 48000,
     }),
     ('zero_value_properties.spx', {
@@ -3330,7 +3443,46 @@ class TestAll(TestCase):
                 self.compare_tag(results, filtered_expected)
                 assert tag.images.any is None
 
-    def test_file_reading_duration(self) -> None:
+    def test_chained_ogg_duration(self) -> None:
+        # Concatenated (chained) Ogg files: the durations of all chain
+        # segments must be summed
+        for segments, chained in (
+            (('vorbis_1s.ogg', 'vorbis_2s.ogg'), 'chained_vorbis.ogg'),
+            (('opus_1s.opus', 'opus_2s.opus'), 'chained_opus.opus'),
+        ):
+            expected_duration = 0.0
+            for segment in segments:
+                filename = os.path.join(SAMPLE_FOLDER, segment)
+                duration = TinyTag.get(filename).duration
+                assert duration is not None
+                expected_duration += duration
+            self.assertAlmostEqual(expected_duration, 3.0)
+            filename = os.path.join(SAMPLE_FOLDER, chained)
+            duration = TinyTag.get(filename).duration
+            assert duration is not None
+            self.assertAlmostEqual(duration, expected_duration)
+            self.assertAlmostEqual(duration, 3.0)
+
+    def test_chained_ogg_incomplete_segment(self) -> None:
+        # Chained Ogg files with a missing end page, truncated page or
+        # invalid granule positions: the duration must remain unknown
+        # instead of appearing to be complete
+        for testfile in (
+            'chained_opus_truncated.opus',
+            'chained_vorbis_invalid_granule.ogg',
+        ):
+            with self.subTest(testfile=testfile):
+                filename = os.path.join(SAMPLE_FOLDER, testfile)
+                self.assertIsNone(TinyTag.get(filename).duration)
+
+    def test_multiplexed_ogg_duration_not_summed(self) -> None:
+        # Interleaved (multiplexed) streams are not chained: their
+        # durations must not be summed
+        filename = os.path.join(SAMPLE_FOLDER, 'multiplexed_vorbis.ogg')
+        duration = TinyTag.get(filename).duration
+        assert duration is not None
+        self.assertAlmostEqual(duration, 1.0)
+
         for testfile, expected in TEST_FILES.items():
             with self.subTest(testfile=testfile, expected=expected):
                 filename = os.path.join(SAMPLE_FOLDER, testfile)
