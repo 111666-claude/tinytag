@@ -34,6 +34,7 @@ python3 -m pip install tinytag
     * FLAC
     * ASF (WMA)
     * AIFF / AIFF-C
+    * DSF (DSD Stream File)
   * Same API for all formats
   * Small, portable library
   * High code coverage
@@ -182,6 +183,9 @@ value provided by the format is used.
     # AIFF
     audio/aiff
     audio/aiff; codecs="<FourCC>"  # AIFF-C compression type, e.g. "alaw"
+
+    # DSF
+    audio/dsf
 
     # FLAC
     audio/flac

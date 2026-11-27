@@ -17,7 +17,9 @@ from unittest import skipIf, TestCase
 
 from tinytag import ParseError, TinyTagException, UnsupportedFormatError
 from tinytag import Image, Images, OtherFields, OtherImages, TinyTag
-from tinytag.tinytag import _ID3, _MPEG, _Ogg, _Wave, _Flac, _ASF, _MP4, _Aiff
+from tinytag.tinytag import (
+    _ID3, _MPEG, _Ogg, _Wave, _Flac, _ASF, _MP4, _Aiff, _Dsf
+)
 
 TYPE_CHECKING = False
 
@@ -3032,6 +3034,41 @@ TEST_FILES: dict[str, ExpectedTag] = dict([
         'mime_type': 'audio/aiff',
         'filesize': 12,
     }),
+    ('dsf_stereo_5m6.dsf', {
+        'other': OtherFields(),
+        'mime_type': 'audio/dsf',
+        'is_lossless': True,
+        'channels': 2,
+        'samplerate': 5644800,
+        'bitdepth': 1,
+        'duration': 0.01,
+        'filesize': 348,
+        'bitrate': 204.8,
+    }),
+    ('dsf_with_id3.dsf', {
+        'other': OtherFields(),
+        'mime_type': 'audio/dsf',
+        'is_lossless': True,
+        'channels': 2,
+        'samplerate': 5644800,
+        'bitdepth': 1,
+        'duration': 0.01,
+        'filesize': 1904,
+        'bitrate': 409.6,
+        'title': 'DSF title',
+        'artist': 'DSF artist',
+    }),
+    ('detect_dsf.x', {
+        'other': OtherFields(),
+        'mime_type': 'audio/dsf',
+        'is_lossless': True,
+        'channels': 2,
+        'samplerate': 5644800,
+        'bitdepth': 1,
+        'duration': 0.01,
+        'filesize': 348,
+        'bitrate': 204.8,
+    }),
 ])
 
 IMAGE_TEST_FILES: dict[str, ExpectedImages] = dict([
@@ -3237,6 +3274,16 @@ IMAGE_TEST_FILES: dict[str, ExpectedImages] = dict([
             ],
         }),
     }),
+    ('dsf_with_id3.dsf', {
+        'other': OtherImages(),
+        'front_cover': Image(
+            name='front_cover',
+            mime_type='image/jpeg',
+            description='cover',
+            size=1220,
+            data=b'\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x00H\x00H'
+        ),
+    }),
 ])
 
 SAMPLE_FOLDER = os.path.join(os.path.dirname(__file__), 'samples')
@@ -3440,11 +3487,142 @@ class TestAll(TestCase):
             ('invalid_file.wav', _Wave),
             ('invalid_file.asf', _ASF),
             ('invalid_file.aiff', _Aiff),
+            ('invalid_file.dsf', _Dsf),
         ):
             with self.subTest(path=path, cls=cls):
                 with self.assertRaises(ParseError) as context:
                     cls.get(os.path.join(SAMPLE_FOLDER, path))
                 self.assertIsInstance(context.exception, TinyTagException)
+
+    def test_dsf_properties_and_duration(self) -> None:
+        # 2 channels, 5644800 Hz, 1-bit, 56448 samples -> 0.01 s
+        path = os.path.join(SAMPLE_FOLDER, 'dsf_stereo_5m6.dsf')
+        tag = TinyTag.get(path)
+        self.assertEqual(tag.channels, 2)
+        self.assertEqual(tag.samplerate, 5644800)
+        self.assertEqual(tag.bitdepth, 1)
+        self.assertEqual(tag.duration, 0.01)
+        self.assertEqual(tag.mime_type, 'audio/dsf')
+        self.assertTrue(tag.is_lossless)
+        # A zero metadata pointer must not prevent reading the audio
+        self.assertIsNone(tag.title)
+        self.assertIsNone(tag.images.any)
+
+    def test_dsf_id3_tags_and_file_object(self) -> None:
+        path = os.path.join(SAMPLE_FOLDER, 'dsf_with_id3.dsf')
+        tag = TinyTag.get(path, image=True)
+        self.assertEqual(tag.title, 'DSF title')
+        self.assertEqual(tag.artist, 'DSF artist')
+        image = tag.images.any
+        assert image is not None
+        self.assertEqual(image.name, 'front_cover')
+        self.assertEqual(image.mime_type, 'image/jpeg')
+        self.assertEqual(image.size, 1220)
+        # The same data must be readable through a file object
+        with open(path, 'rb') as file_handle:
+            file_obj_tag = TinyTag.get(file_obj=file_handle, image=True)
+        self.assertEqual(file_obj_tag.duration, tag.duration)
+        self.assertEqual(file_obj_tag.channels, tag.channels)
+        self.assertEqual(file_obj_tag.title, 'DSF title')
+        file_obj_image = file_obj_tag.images.any
+        assert file_obj_image is not None
+        self.assertEqual(file_obj_image.data, image.data)
+
+    def test_dsf_error_paths(self) -> None:
+        sample_path = os.path.join(SAMPLE_FOLDER, 'dsf_stereo_5m6.dsf')
+        with open(sample_path, 'rb') as file_handle:
+            valid = file_handle.read()
+
+        def assert_parse_error(blob: bytes) -> None:
+            with self.assertRaises(ParseError):
+                _Dsf.get(
+                    file_obj=BytesIO(blob), check_magic_bytes=False)
+
+        def patched(offset: int, value: int, length: int = 4) -> bytes:
+            return (
+                valid[:offset]
+                + value.to_bytes(length, 'little')
+                + valid[offset + length:]
+            )
+
+        # Truncated chunks
+        assert_parse_error(valid[:10])
+        # Truncated fmt chunk header with a consistent declared file size
+        truncated_fmt_header = valid[:28 + 6]
+        truncated_fmt_header = (
+            truncated_fmt_header[:12]
+            + len(truncated_fmt_header).to_bytes(8, 'little')
+            + truncated_fmt_header[20:]
+        )
+        assert_parse_error(truncated_fmt_header)
+        assert_parse_error(valid[:28 + 52 + 4])
+        # Truncated fmt payload: shrink the declared file size so the
+        # DSD chunk passes and the short fmt payload is reported instead
+        truncated_fmt = valid[:28 + 12 + 10]
+        truncated_fmt = (
+            truncated_fmt[:12]
+            + len(truncated_fmt).to_bytes(8, 'little')
+            + truncated_fmt[20:]
+        )
+        assert_parse_error(truncated_fmt)
+        # Invalid DSD chunk id and size
+        assert_parse_error(b'xxxx' + valid[4:])
+        assert_parse_error(patched(4, 20, 8))
+        # Declared file size exceeds the actual file
+        assert_parse_error(patched(12, len(valid) + 1, 8))
+        # Invalid fmt chunk id and size
+        assert_parse_error(b'bad!' + valid[32:])
+        assert_parse_error(patched(32, 40, 8))
+        # Invalid fmt payload fields
+        assert_parse_error(patched(40, 2))        # format version
+        assert_parse_error(patched(44, 1))        # format id
+        assert_parse_error(patched(52, 0))        # channels
+        assert_parse_error(patched(56, 0))        # sample rate
+        assert_parse_error(patched(60, 8))        # bits per sample
+        assert_parse_error(patched(64, 0, 8))     # sample count
+        assert_parse_error(patched(72, 0))        # block size
+        # Invalid data chunk id and size
+        assert_parse_error(b'nope' + valid[84:])
+        assert_parse_error(patched(84, 8, 8))
+        # Truncated data chunk header with a consistent declared size
+        truncated_data = valid[:80 + 6]
+        truncated_data = (
+            truncated_data[:12]
+            + len(truncated_data).to_bytes(8, 'little')
+            + truncated_data[20:]
+        )
+        assert_parse_error(truncated_data)
+        # Metadata pointer past the end of the file
+        assert_parse_error(patched(20, len(valid) + 1, 8))
+
+    def test_dsf_extended_fmt_and_empty_data(self) -> None:
+        sample_path = os.path.join(SAMPLE_FOLDER, 'dsf_stereo_5m6.dsf')
+        with open(sample_path, 'rb') as file_handle:
+            valid = file_handle.read()
+        # A larger fmt chunk must be skipped without breaking parsing
+        extended = (
+            valid[:32] + (56).to_bytes(8, 'little')
+            + valid[40:80] + b'\x00' * 4 + valid[80:]
+        )
+        # Keep the declared DSD file size consistent with the blob
+        extended = (
+            extended[:12] + len(extended).to_bytes(8, 'little')
+            + extended[20:]
+        )
+        tag = _Dsf.get(
+            file_obj=BytesIO(extended), check_magic_bytes=False)
+        self.assertEqual(tag.duration, 0.01)
+        self.assertEqual(tag.bitrate, 204.8)
+        # A data chunk without audio payload yields no bitrate
+        no_audio = valid[:84] + (12).to_bytes(8, 'little')
+        no_audio = (
+            no_audio[:12] + len(no_audio).to_bytes(8, 'little')
+            + no_audio[20:]
+        )
+        tag = _Dsf.get(
+            file_obj=BytesIO(no_audio), check_magic_bytes=False)
+        self.assertEqual(tag.duration, 0.01)
+        self.assertIsNone(tag.bitrate)
 
     def test_image_construction(self) -> None:
         name = 'front_cover'
@@ -3509,6 +3687,7 @@ class TestAll(TestCase):
             ('detect_asf.x', _ASF),
             ('detect_mp4_m4a.x', _MP4),
             ('detect_aiff.x', _Aiff),
+            ('detect_dsf.x', _Dsf),
         ):
             with self.subTest(testfile=testfile, expected=expected):
                 filename = os.path.join(SAMPLE_FOLDER, testfile)

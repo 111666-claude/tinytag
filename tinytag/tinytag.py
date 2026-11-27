@@ -80,7 +80,7 @@ class TinyTag:
         '.wav', '.flac',
         '.wma', '.wmv', '.asf',
         '.m4b', '.m4a', '.m4r', '.m4v', '.mp4', '.aax', '.aaxc',
-        '.aiff', '.aifc', '.aif', '.afc'
+        '.aiff', '.aifc', '.aif', '.afc', '.dsf'
     )
     _OTHER_PREFIX = 'other.'
     _file_extension_mapping: dict[tuple[str, ...], type[TinyTag]] | None = None
@@ -221,6 +221,7 @@ class TinyTag:
                 ('.m4b', '.m4a', '.m4r', '.m4v', '.mp4',
                  '.aax', '.aaxc'): _MP4,
                 ('.aiff', '.aifc', '.aif', '.afc'): _Aiff,
+                ('.dsf',): _Dsf,
             }
         filename = filename.lower()
         for ext, tagclass in cls._file_extension_mapping.items():
@@ -265,6 +266,8 @@ class TinyTag:
         if (header.startswith(b'FORM')
                 and header.startswith((b'AIFF', b'AIFC'), 8)):
             return _Aiff
+        if header.startswith(b'DSD '):
+            return _Dsf
         return None
 
     @classmethod
@@ -2527,4 +2530,103 @@ class _Aiff(TinyTag):
             else:  # some other chunk, just skip the data
                 fh.seek(subchunk_size, SEEK_CUR)
             chunk_header = fh.read(header_len)
+        self._tags_parsed = self._parse_tags
+
+
+class _Dsf(TinyTag):
+    """DSF (DSD Stream File) Parser.
+
+    https://dsd-guide.com/sites/default/files/white-papers/DSFFileFormatSpec_E.pdf
+    """
+
+    _CHUNK_HEADER_SIZE = 12
+    _DSD_CHUNK_SIZE = 28
+    _FMT_CHUNK_SIZE = 52
+    _FMT_FIELDS_SIZE = 40
+
+    def _parse(self, fh: BinaryIO) -> None:
+        # DSD chunk (file header)
+        dsd_chunk = fh.read(self._DSD_CHUNK_SIZE)
+        if (len(dsd_chunk) != self._DSD_CHUNK_SIZE
+                or not dsd_chunk.startswith(b'DSD ')):
+            raise ParseError('Invalid DSF header')
+        dsd_chunk_size, file_size, metadata_offset = unpack_from(
+            '<QQQ', dsd_chunk, 4)
+        if dsd_chunk_size != self._DSD_CHUNK_SIZE:
+            raise ParseError('Invalid DSF DSD chunk size')
+        if file_size > self.filesize:
+            raise ParseError('DSF file size exceeds actual file size')
+
+        # fmt chunk
+        chunk_header = fh.read(self._CHUNK_HEADER_SIZE)
+        if (len(chunk_header) != self._CHUNK_HEADER_SIZE
+                or not chunk_header.startswith(b'fmt ')):
+            raise ParseError('Invalid DSF fmt chunk header')
+        fmt_chunk_size = unpack_from('<Q', chunk_header, 4)[0]
+        if fmt_chunk_size < self._FMT_CHUNK_SIZE:
+            raise ParseError('Invalid DSF fmt chunk size')
+        fmt_fields = fh.read(self._FMT_FIELDS_SIZE)
+        if len(fmt_fields) != self._FMT_FIELDS_SIZE:
+            raise ParseError('Truncated DSF fmt chunk')
+        (fmt_version, format_id, _channel_type, channels,
+         samplerate, bits_per_sample, num_samples,
+         block_size_per_channel, _reserved) = unpack_from(
+            '<IIIIIIQII', fmt_fields)
+        if fmt_version != 1:
+            raise ParseError('Unsupported DSF format version')
+        if format_id != 0:
+            raise ParseError('Unsupported DSF format id')
+        if channels < 1:
+            raise ParseError('Invalid number of DSF channels')
+        if samplerate < 1:
+            raise ParseError('Invalid DSF sample rate')
+        if bits_per_sample != 1:
+            raise ParseError('Invalid DSF bits per sample')
+        if num_samples < 1:
+            raise ParseError('Invalid number of DSF samples')
+        if block_size_per_channel < 1:
+            raise ParseError('Invalid DSF block size')
+
+        # Skip remaining bytes of the fmt chunk, if any
+        remaining_fmt_size = fmt_chunk_size - self._FMT_CHUNK_SIZE
+        if remaining_fmt_size > 0:
+            fh.seek(remaining_fmt_size, SEEK_CUR)
+
+        # data chunk
+        chunk_header = fh.read(self._CHUNK_HEADER_SIZE)
+        if (len(chunk_header) != self._CHUNK_HEADER_SIZE
+                or not chunk_header.startswith(b'data')):
+            raise ParseError('Invalid DSF data chunk header')
+        data_chunk_size = unpack_from('<Q', chunk_header, 4)[0]
+        if data_chunk_size < self._CHUNK_HEADER_SIZE:
+            raise ParseError('Invalid DSF data chunk size')
+        audio_data_size = data_chunk_size - self._CHUNK_HEADER_SIZE
+
+        self.mime_type = 'audio/dsf'
+        if self._parse_duration:
+            self.is_lossless = True
+            self.channels = channels
+            self.samplerate = samplerate
+            self.bitdepth = 1
+            self.duration = num_samples / samplerate
+            if audio_data_size > 0:
+                self.bitrate = (
+                    audio_data_size * 8 / self.duration / 1000)
+            self._duration_parsed = True
+
+        # Optional ID3v2 metadata chunk at the end of the file
+        if self._parse_tags and metadata_offset > 0:
+            if metadata_offset >= self.filesize:
+                raise ParseError('DSF metadata pointer out of bounds')
+            fh.seek(metadata_offset)
+            # pylint: disable=protected-access
+            id3 = _ID3()
+            id3.filename = self.filename
+            id3.filesize = self.filesize
+            id3._filehandler = fh
+            id3._only_id3 = True
+            id3._default_encoding = self._default_encoding
+            id3._load(
+                tags=True, duration=False, image=self._load_image)
+            self._update(id3)
         self._tags_parsed = self._parse_tags
