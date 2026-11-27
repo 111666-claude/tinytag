@@ -76,6 +76,7 @@ class TinyTag:
 
     SUPPORTED_FILE_EXTENSIONS = (
         '.mp1', '.mp2', '.mp3',
+        '.aac',
         '.oga', '.ogv', '.ogg', '.opus', '.spx',
         '.wav', '.flac',
         '.wma', '.wmv', '.asf',
@@ -215,6 +216,7 @@ class TinyTag:
         if cls._file_extension_mapping is None:
             cls._file_extension_mapping = {
                 ('.mp1', '.mp2', '.mp3', '.flac'): _ID3,
+                ('.aac',): _ADTS,
                 ('.oga', '.ogv', '.ogg', '.opus', '.spx'): _Ogg,
                 ('.wav',): _Wave,
                 ('.wma', '.wmv', '.asf'): _ASF,
@@ -239,6 +241,9 @@ class TinyTag:
             return _ID3
         if (len(header) >= 2
                 and header[0] == 0xFF and (header[1] & 0xE0) == 0xE0):
+            if (header[1] & 0xF6) == 0xF0:
+                # ADTS AAC frames use a 12 bit sync word with layer bits "00"
+                return _ADTS
             footer = None
             try:
                 # pylint: disable=protected-access
@@ -275,15 +280,19 @@ class TinyTag:
     ) -> type[TinyTag]:
         if cls != TinyTag:
             return cls
+        parser_class = None
         if filename:
             parser_class = cls._get_parser_for_filename(filename)
-            if parser_class is not None:
-                return parser_class
-        # try determining the file type by magic byte header, if provided
-        if filehandle:
-            parser_class = cls._get_parser_for_file_handle(filehandle)
-            if parser_class is not None:
-                return parser_class
+        # Magic byte detection is still consulted for raw ADTS file names: an
+        # '.aac' suffix may also contain another supported container (e.g.
+        # MP4 audio), and extensionless files rely on magic bytes entirely.
+        if filehandle and (parser_class is None or parser_class is _ADTS):
+            magic_class = cls._get_parser_for_file_handle(filehandle)
+            filehandle.seek(0)
+            if magic_class is not None:
+                return magic_class
+        if parser_class is not None:
+            return parser_class
         raise UnsupportedFormatError(
             'No tag reader found to support file type')
 
@@ -1094,6 +1103,19 @@ class _ID3(TinyTag):
                 tags=self._parse_tags, duration=self._parse_duration,
                 image=self._load_image)
             self._update(flac_tag)
+        elif len(header) >= 2 and header[0] == 0xFF \
+                and (header[1] & 0xF6) == 0xF0:
+            # ID3 tag followed by raw ADTS AAC frames
+            self.mime_type = 'audio/aac'
+            if self._parse_duration:
+                fh.seek(audio_offset)
+                adts_tag = _ADTS()
+                adts_tag.filename = self.filename
+                adts_tag.filesize = self.filesize
+                # pylint: disable=protected-access
+                adts_tag._filehandler = fh
+                adts_tag._load(tags=False, duration=True)
+                self._update(adts_tag)
         else:
             self.mime_type = 'audio/mpeg'
             end_padding = 0
@@ -1656,6 +1678,95 @@ class _MPEG(TinyTag):
         frames = unpack_from('>I', content, offset)[0]
         offset += 4
         return frames, byte_count
+
+
+class _ADTS(_MPEG):
+    """ADTS (Audio Data Transport Stream) parser for raw AAC streams."""
+
+    # ISO/IEC 13818-7 sampling_frequency_index values
+    _ADTS_SAMPLE_RATES = (
+        96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050,
+        16000, 12000, 11025, 8000, 7350,
+    )
+    # an AAC frame carries 1024 samples per raw data block
+    _ADTS_SAMPLES_PER_FRAME = 1024
+    # channel_configuration value -> number of channels.
+    # A value of 0 means the channel count is defined out of band (PCE).
+    _ADTS_CHANNELS = (0, 1, 2, 3, 4, 5, 6, 8)
+
+    def _parse(self, fh: BinaryIO) -> None:
+        self.mime_type = 'audio/aac'
+        if not self._parse_duration:
+            return
+        self.is_lossless = False
+        if not self.filesize:
+            # TinyTag.get() provides the size; determine it here as well so
+            # truncated frames are detected when the parser is used directly
+            stream_offset = fh.tell()
+            try:
+                fh.seek(0, SEEK_END)
+                self.filesize = fh.tell()
+            except (OSError, ValueError):
+                self.filesize = 0
+            fh.seek(stream_offset)
+        frames = 0
+        total_samples = 0
+        frame_size_accu = 0
+        while True:
+            # ADTS fixed header is 7 bytes, or 9 bytes when a CRC is present
+            frame_offset = fh.tell()
+            header = fh.read(7)
+            if not header:
+                break  # regular EOF after the last complete frame
+            if len(header) < 7:
+                raise ParseError('Truncated ADTS frame header')
+            # 12 sync bits (0xFFF) and layer bits "00" distinguish ADTS from
+            # an MPEG audio frame (whose layer field is never "00")
+            if header[0] != 0xFF or (header[1] & 0xF6) != 0xF0:
+                raise ParseError('Invalid ADTS frame sync word')
+            protection_absent = header[1] & 0x01
+            header_size = 7 if protection_absent else 9
+            if not protection_absent and len(fh.read(2)) < 2:
+                raise ParseError('Truncated ADTS frame CRC')
+            samplerate_id = (header[2] >> 2) & 0x0F
+            if samplerate_id >= len(self._ADTS_SAMPLE_RATES):
+                raise ParseError('Invalid ADTS sample rate index')
+            channel_config = (
+                ((header[2] & 0x01) << 2)
+                | ((header[3] >> 6) & 0x03)
+            )
+            frame_length = (
+                ((header[3] & 0x03) << 11)
+                | (header[4] << 3)
+                | ((header[5] >> 5) & 0x07)
+            )
+            blocks_in_frame = header[6] & 0x03
+            if frame_length < header_size:
+                raise ParseError('Invalid ADTS frame length')
+            frame_end = frame_offset + frame_length
+            if self.filesize and frame_end > self.filesize:
+                raise ParseError('Truncated ADTS frame data')
+            if frames == 0:
+                self.samplerate = self._ADTS_SAMPLE_RATES[samplerate_id]
+                if channel_config != 0:
+                    self.channels = self._ADTS_CHANNELS[channel_config]
+            # number_of_raw_data_blocks_in_frame is zero based
+            total_samples += (
+                (blocks_in_frame + 1) * self._ADTS_SAMPLES_PER_FRAME)
+            frame_size_accu += frame_length
+            frames += 1
+            fh.seek(frame_end)
+        if frames == 0 or self.samplerate is None:
+            raise ParseError('No valid ADTS frames found')
+        self.duration = total_samples / self.samplerate
+        self.bitrate = frame_size_accu * 8 / self.duration / 1000
+        self._duration_parsed = True
+
+
+# alternate names, since raw ADTS streams are commonly referred to as AAC
+_AAC = _ADTS
+_Aac = _ADTS
+_Adts = _ADTS
 
 
 class _Ogg(TinyTag):
