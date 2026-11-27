@@ -34,7 +34,7 @@ from __future__ import annotations
 from binascii import a2b_base64
 from io import BytesIO
 from os import PathLike, SEEK_CUR, SEEK_END, environ, fsdecode
-from struct import unpack, unpack_from
+from struct import error as StructError, unpack, unpack_from
 
 TYPE_CHECKING = False
 
@@ -509,6 +509,45 @@ class _MP4(TinyTag):
         'barcode': 'other.barcode',
         'catalognumber': 'other.catalog_number',
     }
+    # Metadata keys stored in a QuickTime/MP4 'keys' atom using the 'mdta'
+    # namespace. Entries map the lower-cased key name to a TinyTag field.
+    # Keys missing from this mapping are exposed verbatim (lower-cased) in
+    # the ``other`` fields. Indices into the key table are 1-based.
+    _MDTA_KEY_NAMESPACE = b'mdta'
+    _MDTA_FIELD_MAPPING = {
+        # short key names used by the 'mdta' namespace
+        'title': 'title',
+        'artist': 'artist',
+        'artists': 'artist',
+        'album': 'album',
+        'album_artist': 'albumartist',
+        'albumartist': 'albumartist',
+        'composer': 'composer',
+        'genre': 'genre',
+        'date': 'year',
+        'year': 'year',
+        'comment': 'comment',
+        'copyright': 'other.copyright',
+        'description': 'other.description',
+        'synopsis': 'other.description',
+        'publisher': 'other.publisher',
+        'subtitle': 'other.set_subtitle',
+        'language': 'other.language',
+        'encoder': 'other.encoded_by',
+        'encoded_by': 'other.encoded_by',
+        'bpm': 'other.bpm',
+        'tempo': 'other.bpm',
+        # reverse-DNS style key names
+        'com.apple.quicktime.title': 'title',
+        'com.apple.quicktime.artist': 'artist',
+        'com.apple.quicktime.album': 'album',
+        'com.apple.quicktime.composer': 'composer',
+        'com.apple.quicktime.genre': 'genre',
+        'com.apple.quicktime.creationdate': 'year',
+        'com.apple.quicktime.comment': 'comment',
+        'com.apple.quicktime.copyright': 'other.copyright',
+        'com.apple.quicktime.description': 'other.description',
+    }
     _IMAGE_MIME_TYPES = {
         12: 'image/gif',
         13: 'image/jpeg',
@@ -536,12 +575,15 @@ class _MP4(TinyTag):
     _audio_data_tree: _AtomTreeDict | None = None
     _meta_data_tree: _AtomTreeDict | None = None
     _combined_tree: _AtomTreeDict | None = None
+    # Per-parse 1-based table of 'mdta' key names from the 'keys' atom.
+    _mp4_keys: list[str | None]
 
     def _parse(self, fh: BinaryIO) -> None:
         # The parser tree: Each key is an atom name which is traversed if
         # existing. Leaves of the parser tree are callables which receive
         # the atom data. Callables return {fieldname: value} which is updates
         # the TinyTag.
+        self._mp4_keys = [None]  # 1-based 'mdta' key table
         tree: _AtomTreeDict = {}
         if self._parse_duration and self._parse_tags:
             tree = self._build_combined_tree()
@@ -608,6 +650,13 @@ class _MP4(TinyTag):
                 b'covr': {b'data': _MP4._parse_cover_image},
                 b'----': _MP4._parse_custom_field,
             }}}}, b'uuid': _MP4._parse_uuid}
+            # Keyed ('mdta') metadata is commonly stored in moov/meta as
+            # well as moov/udta/meta; parse both with the same meta tree.
+            moov_tree = cls._meta_data_tree[b'moov']
+            if isinstance(moov_tree, dict):
+                udta_tree = moov_tree[b'udta']
+                if isinstance(udta_tree, dict):
+                    moov_tree[b'meta'] = udta_tree[b'meta']
         return cls._meta_data_tree
 
     @classmethod
@@ -679,6 +728,11 @@ class _MP4(TinyTag):
                 if atom_type in self._FLAGGED_ATOMS:  # skip atom flags
                     curr_pos = fh.seek(4, SEEK_CUR)
                     atom_size -= 4
+            if atom_type == b'meta':
+                # Load a possible 'mdta' key table up-front so the 'ilst'
+                # items can be resolved to their real names, independent of
+                # whether 'keys' precedes or follows 'ilst'.
+                self._mp4_keys = self._read_mp4_keys_table(fh, atom_size)
             sub_path = path.get(atom_type)
             # if the path-leaf is a callable, call it on the atom data
             if callable(sub_path):
@@ -710,10 +764,8 @@ class _MP4(TinyTag):
                     curr_path=curr_path + [atom_type]
                 )
             # unknown data atom, try to parse it
-            elif curr_path == self._ILST_PATH:
-                field_name = (
-                    self._OTHER_PREFIX + atom_type.decode('latin-1').lower()
-                )
+            elif curr_path is not None and curr_path[-1] == b'ilst':
+                field_name = self._mp4_ilst_field_name(atom_type)
                 fh.seek(-header_size, SEEK_CUR)
                 curr_pos -= header_size
                 curr_pos = self._traverse_atoms(
@@ -730,6 +782,112 @@ class _MP4(TinyTag):
                 return curr_pos  # return to parent (next parent node in tree)
             atom_type, header_size, atom_size = self._read_atom_header(fh)
         return curr_pos
+
+    def _read_mp4_keys_table(
+        self, fh: BinaryIO, meta_size: int
+    ) -> list[str | None]:
+        """Find and parse the 'keys' box of the current 'meta' atom.
+
+        The scan is bounded by ``meta_size`` and always restores the file
+        position, so it works for both file paths and file objects. Bad atom
+        or entry lengths and truncated payloads only shorten the table; they
+        never cause out-of-bounds reads or misaligned indices.
+        """
+        keys: list[str | None] = [None]  # indices are 1-based
+        table_start = fh.tell()
+        meta_end = table_start + max(0, meta_size)
+        try:
+            pos = table_start
+            while pos + 8 <= meta_end:
+                fh.seek(pos)
+                header = fh.read(8)
+                if len(header) < 8:
+                    break
+                child_size = unpack_from('>I', header)[0]
+                child_type = header[4:8]
+                header_size = 8
+                if child_size == 1:  # 64-bit extended size
+                    ext_header = fh.read(8)
+                    if len(ext_header) < 8:
+                        break
+                    child_size = unpack('>Q', ext_header)[0]
+                    header_size = 16
+                elif child_size == 0:  # box extends to end of 'meta'
+                    child_size = meta_end - pos
+                if child_size < header_size:
+                    break
+                payload_start = pos + header_size
+                if child_type == b'keys':
+                    available = max(0, min(
+                        child_size - header_size, meta_end - payload_start))
+                    fh.seek(payload_start)
+                    keys = self._parse_mp4_keys(fh.read(available))
+                    break
+                if pos + child_size > meta_end:
+                    break
+                pos += child_size
+        except (OSError, StructError):
+            return [None]
+        finally:
+            fh.seek(table_start)
+        return keys
+
+    @classmethod
+    def _parse_mp4_keys(cls, data: bytes) -> list[str | None]:
+        """Parse the payload of a 'keys' box into a 1-based name table."""
+        keys: list[str | None] = [None]
+        if len(data) < 8:
+            return keys
+        # The first four payload bytes are version and flags.
+        entry_count = unpack_from('>I', data, 4)[0]
+        offset = 8
+        data_len = len(data)
+        for _ in range(entry_count):
+            if offset + 8 > data_len:
+                break  # truncated entry header
+            key_size = unpack_from('>I', data, offset)[0]
+            namespace = data[offset + 4:offset + 8]
+            if key_size < 8 or key_size > data_len - offset:
+                # A bad length makes the next entry offset unknown; stop to
+                # avoid out-of-bounds reads and index misassociation.
+                break
+            if namespace == cls._MDTA_KEY_NAMESPACE:
+                raw_name = data[offset + 8:offset + key_size]
+                name = raw_name.split(b'\x00', 1)[0]
+                keys.append(name.decode('utf-8', 'replace'))
+            else:
+                # Preserve index alignment for other key namespaces.
+                keys.append(None)
+            offset += key_size
+        return keys
+
+    def _mp4_ilst_field_name(self, atom_type: bytes) -> str:
+        """Resolve an 'ilst' item atom type to a TinyTag field name.
+
+        In keyed ('mdta') metadata the item type is the big-endian 1-based
+        index into the 'keys' table. Some writers store that index using
+        ASCII digits instead, so both encodings are accepted. Anything that
+        does not resolve to a known table index keeps the legacy behaviour
+        of exposing the raw atom type under 'other'.
+        """
+        keys = self._mp4_keys
+        if len(atom_type) == 4:
+            for index in self._mp4_key_indices(atom_type):
+                if 0 < index < len(keys):
+                    key_name = keys[index]
+                    if key_name:
+                        key_name = key_name.lower()
+                        return self._MDTA_FIELD_MAPPING.get(
+                            key_name, self._OTHER_PREFIX + key_name)
+        return self._OTHER_PREFIX + atom_type.decode('latin-1').lower()
+
+    @staticmethod
+    def _mp4_key_indices(atom_type: bytes) -> Iterator[int]:
+        """Yield possible 1-based 'keys' indices encoded by an item type."""
+        yield unpack('>I', atom_type)[0]  # canonical big-endian uint32
+        ascii_index = atom_type.strip(b'\x00 ')
+        if ascii_index.isdigit():
+            yield int(ascii_index)
 
     @classmethod
     def _data_parser(
