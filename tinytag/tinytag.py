@@ -35,6 +35,7 @@ from binascii import a2b_base64
 from io import BytesIO
 from os import PathLike, SEEK_CUR, SEEK_END, environ, fsdecode
 from struct import unpack, unpack_from
+from zlib import decompressobj, error as ZlibError
 
 TYPE_CHECKING = False
 
@@ -976,6 +977,7 @@ class _ID3(TinyTag):
     _VALID_STRING_ENCODINGS = {0x00, 0x01, 0x02, 0x03}
     _ID3V1_TAG_SIZE = 128
     _ID3V2_HEADER_SIZE = 10
+    _MAX_DECOMPRESSED_FRAME_SIZE = 16 * 1024 * 1024  # 16 MiB
     _MAX_ESTIMATION_SEC = 30.0
     _CBR_DETECTION_FRAME_COUNT = 5
     _USE_XING_HEADER = True  # much faster, but can be deactivated for testing
@@ -1347,9 +1349,27 @@ class _ID3(TinyTag):
         if frame_size > total_size:
             # invalid frame size, stop here
             return -1
+        compression = encryption = False
+        if id3version == 3:
+            # https://id3.org/id3v2.3.0#Frame_header_flags
+            format_flags = header[9]
+            encryption = bool(format_flags & 0x40)
+            compression = bool(format_flags & 0x80)
+        elif id3version == 4:
+            # https://id3.org/id3v2.4.0-structure#Frame_header_flags
+            format_flags = header[9]
+            encryption = bool(format_flags & 0x04)
+            compression = bool(format_flags & 0x08)
+        if encryption:
+            # encrypted frames can't be parsed, skip them
+            fh.seek(frame_size, SEEK_CUR)
+            return parsed_size
         if self._parse_tags and frame_id in self._ID3_MAPPING:
             fieldname = self._ID3_MAPPING[frame_id]
-            content = fh.read(frame_size)
+            content = self._read_frame_content(
+                fh, frame_size, compression, id3version)
+            if content is None:
+                return parsed_size
             if fieldname in {'comment', 'other.lyrics'}:
                 encoding = content[0]
                 content = content[4:]
@@ -1406,12 +1426,18 @@ class _ID3(TinyTag):
                 else:
                     self._set_field(fieldname, value)
         elif self._parse_tags and frame_id in self._SYNCED_LYRICS_FRAME_IDS:
-            content = fh.read(frame_size)
+            content = self._read_frame_content(
+                fh, frame_size, compression, id3version)
+            if content is None:
+                return parsed_size
             lyrics = self._parse_synced_lyrics(content)
             self._set_other_field('lyrics', lyrics)
         elif self._parse_tags and frame_id in self._CUSTOM_FRAME_IDS:
             # custom fields
-            content = fh.read(frame_size)
+            content = self._read_frame_content(
+                fh, frame_size, compression, id3version)
+            if content is None:
+                return parsed_size
             encoding = content[0]
             end_pos = self._find_string_end_pos(
                 content, encoding, start_pos=1)
@@ -1420,7 +1446,10 @@ class _ID3(TinyTag):
             if description and value:
                 self._set_custom_field(description, value)
         elif self._parse_tags and frame_id == b'PRIV':
-            content = fh.read(frame_size)
+            content = self._read_frame_content(
+                fh, frame_size, compression, id3version)
+            if content is None:
+                return parsed_size
             owner_id_end_pos = self._find_string_end_pos(content)
             owner_id = content[:owner_id_end_pos - 1]
             if owner_id == b'XMP':
@@ -1429,7 +1458,10 @@ class _ID3(TinyTag):
                 self._set_other_field('xmp', value)
         elif self._parse_tags and frame_id not in self._IGNORED_FRAME_IDS:
             # unknown, try to add to other dict
-            content = fh.read(frame_size)
+            content = self._read_frame_content(
+                fh, frame_size, compression, id3version)
+            if content is None:
+                return parsed_size
             encoding = content[0]
             if encoding in self._VALID_STRING_ENCODINGS:
                 value = self._decode_string(content[1:], encoding)
@@ -1439,13 +1471,51 @@ class _ID3(TinyTag):
                 self._OTHER_PREFIX + frame_id.decode('latin-1').lower(),
                 value)
         elif self._load_image and frame_id in self._IMAGE_FRAME_IDS:
-            content = fh.read(frame_size)
+            content = self._read_frame_content(
+                fh, frame_size, compression, id3version)
+            if content is None:
+                return parsed_size
             field_name, image = self._parse_image(frame_id, content)
             # pylint: disable=protected-access
             self.images._set_field(field_name, image)
         else:  # skip frame
             fh.seek(frame_size, SEEK_CUR)
         return parsed_size
+
+    def _read_frame_content(self,
+                            fh: BinaryIO,
+                            frame_size: int,
+                            compression: bool,
+                            id3version: int | None) -> bytes | None:
+        content = fh.read(frame_size)
+        if not compression:
+            return content
+        return self._decompress_frame_content(content, id3version)
+
+    def _decompress_frame_content(self,
+                                  content: bytes,
+                                  id3version: int | None) -> bytes | None:
+        # A compressed frame starts with the decompressed size of the
+        # frame data (4 bytes, synchsafe in ID3v2.4), followed by
+        # zlib-compressed data.
+        if len(content) <= 4:
+            return None
+        if id3version == 4:
+            decompressed_size = self._unsynchsafe(content)
+        else:
+            decompressed_size = unpack_from('>I', content)[0]
+        if not 0 < decompressed_size <= self._MAX_DECOMPRESSED_FRAME_SIZE:
+            # invalid decompressed size
+            return None
+        decompressor = decompressobj()
+        try:
+            result = decompressor.decompress(content[4:], decompressed_size)
+        except ZlibError:
+            return None
+        if not result or not decompressor.eof:
+            # empty, truncated or otherwise corrupt compressed data
+            return None
+        return result
 
     @staticmethod
     def _find_string_end_pos(content: bytes,
